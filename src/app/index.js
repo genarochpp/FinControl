@@ -10,17 +10,14 @@
 //  4. AI zone rediseñada en columna vertical — sin superposiciones.
 //  5. Header usa paddingTop en ScrollView (no position:absolute que bloquea).
 //     zIndex y pointerEvents revisados para no bloquear toques.
-//  6. Supabase integrado en StorageService y AuditService con fallback local.
-//  7. BUG ELIMINACIÓN DEFINITIVO: StorageService opera siempre sobre
-//     AsyncStorage local como fuente de verdad. Supabase se llama en
-//     segundo plano (fire-and-forget). El estado nunca se reemplaza con
-//     datos de Supabase — solo con la lista local filtrada/mapeada.
-//     handleSave/handleUpdate/handleDelete en DashboardScreen corregidos.
+//  6. (Reemplazado por el punto 19) Supabase pasó a ser la fuente de la verdad compartida.
+//  7. Eliminar un gasto quita SOLO ese gasto de la lista que se ve (antes podía vaciar
+//     todo) y el borrado llega a Supabase y a los demás celulares (ver el punto 19).
 //  8. CategoryDetailModal: donut chart puro en RN + desglose por ítem
 //     con porcentaje y barra proporcional. Filas de categoría en StatsScreen
 //     ahora son presionables (PressCard onPress → setSelectedCat).
 //  9. (Reemplazado por el punto 16) La exportación CSV con Share.share() ya no existe.
-//     "Sincronizar con Supabase" eliminado — sync ocurre en background.
+//     La sincronización es automática; en Ajustes hay un botón para forzarla.
 // 10. Gastos fijos (plantilla mensual + carga masiva) y Control de cuotas.
 // 11. Formato numérico argentino: miles con punto, decimales con coma.
 //     maskAmountInput() formatea mientras se escribe; parseAmount() convierte
@@ -45,14 +42,19 @@
 //     muestra el gasto por persona y el modal de gastos tiene una cruz para cerrarlo.
 // 18. Informes: el Excel lleva el formato como atributos HTML (los programas de hojas de
 //     cálculo ignoran el CSS) y el PDF suma el logo y las tarjetas de métricas destacadas.
+// 19. Familia sincronizada: gastos, gastos fijos, cuotas, presupuestos, límites y auditoría
+//     viven en Supabase y se comparten entre todos los celulares. Cada cambio se ve al instante
+//     en los demás (Supabase Realtime: INSERT / UPDATE / DELETE). Si no hay internet los cambios
+//     quedan en una cola en el celular y se envían solos. Requiere ejecutar una vez el archivo
+//     supabase/migrations/20261016_familia_sincronizada.sql.
 // ═══════════════════════════════════════════════════════════════════════════
 
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, TouchableWithoutFeedback,
   TextInput, StyleSheet, Animated, Dimensions, KeyboardAvoidingView,
   Platform, StatusBar, Modal, Alert, SafeAreaView,
-  ActivityIndicator, Switch, Share,
+  ActivityIndicator, Switch, Share, AppState,
 } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -144,75 +146,44 @@ const showAlert = (title, message, buttons) => {
 // STORAGE KEYS
 // ─────────────────────────────────────────────────────────────────────────────
 const KEYS = {
-  TRANSACTIONS:    'fincontrol:transactions:v1',
+  TRANSACTIONS:    'fincontrol:transactions:v1',      // copias locales (caché) de lo que hay en la nube
   CATEGORY_LIMITS: 'fincontrol:category_limits:v1',
   GLOBAL_LIMITS:   'fincontrol:global_limits:v1',
-  PREFS:           'fincontrol:prefs:v1',
   AUDIT_LOGS:      'fincontrol:audit:v1',
-  FIXED_EXPENSES:  'fincontrol:fixed_expenses:v1',  // gastos fijos configurados
-  INSTALLMENTS:    'fincontrol:installments:v1',    // compras en cuotas
-  DELETED_IDS:     'fincontrol:deleted_ids:v1',     // gastos borrados cuyo borrado en la nube sigue pendiente
+  FIXED_EXPENSES:  'fincontrol:fixed_expenses:v1',
+  INSTALLMENTS:    'fincontrol:installments:v1',
+  PREFS:           'fincontrol:prefs:v1',             // preferencias de ESTE celular (no se comparten)
+  OUTBOX:          'fincontrol:outbox:v1',            // cambios hechos acá que todavía no llegaron a la nube
+  OUTBOX_FAILED:   'fincontrol:outbox_failed:v1',     // cambios que la nube rechazó por tener datos inválidos
+  CLOUD_MIGRATED:  'fincontrol:cloud_migrated:v1',    // lo que ya había en este celular se subió a la nube
+  DELETED_IDS:     'fincontrol:deleted_ids:v1',       // (versión anterior; ya no se usa)
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AUDIT SERVICE  — Supabase + AsyncStorage fallback
+// SINCRONIZACIÓN EN LA NUBE (Supabase)
+//
+// Supabase es la fuente de la verdad y se comparte entre TODOS los celulares de la
+// familia. Seis tablas: gastos, gastos fijos, cuotas, presupuestos por categoría,
+// límites generales y registro de auditoría. (Las preferencias —modo oscuro, texto
+// grande— son de cada celular y NO se comparten.)
+//
+//  · LEER:  fetchData() (en AppShell) trae las 6 tablas con CloudSync.fetchAll().
+//  · ESCRIBIR: cada cambio se aplica al instante en pantalla, se anota en una cola de
+//    pendientes (OUTBOX, guardada en el celular) y se envía a Supabase. Si no hay
+//    internet o la nube rechaza el cambio, queda en la cola y se reintenta solo: nada
+//    se pierde, y al traer datos de la nube los pendientes se montan encima.
+//  · TIEMPO REAL: subscribeRealtime() escucha INSERT / UPDATE / DELETE de las 6 tablas;
+//    cada cambio de otro celular se aplica a la pantalla con applyChange().
+//  · Una copia de todo se guarda en el celular (caché) para abrir rápido y sin conexión.
 // ─────────────────────────────────────────────────────────────────────────────
-const AuditService = {
-  async logAction(action, targetDesc, user, amount = null) {
-    // La tabla audit_logs de Supabase exige un id (texto): se genera acá y se usa
-    // igual en el teléfono y en la nube. "user" puede quedar vacío: el gasto es opcional.
-    const entry = {
-      id: 'log_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
-      action,
-      target_desc: targetDesc,
-      user: user || '',
-      amount,
-      created_at: new Date().toISOString(),
-    };
-    // Supabase
-    try {
-      const { error } = await supabase.from('audit_logs').insert(entry);
-      if (error) console.warn('[FinControl] Supabase audit_logs:', error.message);
-    } catch (_) { /* fallback to local */ }
-    // Local fallback
-    try {
-      const raw  = await AsyncStorage.getItem(KEYS.AUDIT_LOGS);
-      const logs = raw ? JSON.parse(raw) : [];
-      const next = [entry, ...logs].slice(0, 200);
-      await AsyncStorage.setItem(KEYS.AUDIT_LOGS, JSON.stringify(next));
-      return { data: next[0], error: null };
-    } catch (e) { return { data: null, error: e }; }
-  },
-
-  async getLogs() {
-    // Try Supabase first
-    try {
-      const { data, error } = await supabase
-        .from('audit_logs')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(200);
-      if (!error && data?.length) return { data, error: null };
-    } catch (_) { /* fallback */ }
-    // Local fallback
-    try {
-      const raw = await AsyncStorage.getItem(KEYS.AUDIT_LOGS);
-      return { data: raw ? JSON.parse(raw) : [], error: null };
-    } catch (e) { return { data: [], error: e }; }
-  },
-
-  async clearLogs() {
-    try { await supabase.from('audit_logs').delete().neq('id', 0); } catch (_) {}
-    try {
-      await AsyncStorage.removeItem(KEYS.AUDIT_LOGS);
-      return { error: null };
-    } catch (e) { return { error: e }; }
-  },
+const jsonGet = async (key) => {
+  try { const raw = await AsyncStorage.getItem(key); return raw ? JSON.parse(raw) : null; } catch (_) { return null; }
 };
+const jsonSet = async (key, value) => {
+  try { await AsyncStorage.setItem(key, JSON.stringify(value)); return true; } catch (_) { return false; }
+};
+const toNum = (v) => { const n = Number(v); return isFinite(n) ? n : 0; };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers de sincronización de gastos
-// ─────────────────────────────────────────────────────────────────────────────
 // Columnas que existen en la tabla public.transactions de Supabase. Enviar una
 // propiedad que la tabla no tiene hace que Supabase rechace TODA la fila.
 const REMOTE_TX_FIELDS = ['id', 'amount', 'description', 'category', 'featherIcon', 'type',
@@ -224,227 +195,552 @@ const toRemoteTx = (tx) => {
   return row;
 };
 
-// Une lo guardado en el teléfono con lo que haya en Supabase:
-//  · lo del teléfono manda (la app es "local primero"),
-//  · se agregan los gastos que SOLO están en la nube (por ejemplo, cargados desde otro teléfono),
-//  · nunca vuelve a aparecer un gasto que ya se borró (aunque la nube todavía lo tenga).
-const mergeTransactions = (local, remote, deletedSet) => {
-  const base  = (local || []).filter(t => t && !deletedSet.has(t.id));
-  const known = new Set(base.map(t => t.id));
-  const extra = (remote || [])
-    .filter(t => t && !known.has(t.id) && !deletedSet.has(t.id))
-    .map(t => ({ ...t, amount: Number(t.amount), is_recurring: !!t.is_recurring }));
-  if (extra.length === 0) return base;
-  return [...base, ...extra].sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+// Cómo se guarda y se lee cada tabla compartida.
+//  · idKey: columna que identifica cada fila · newestFirst: las filas nuevas van al principio
+//  · orderBy: orden con el que se lee de la nube (inserted_at conserva el orden de carga)
+//  · toRemote / fromRemote: pasan de la forma que usa la app a la de la tabla, y al revés
+const SYNC_TABLES = {
+  transactions: {
+    table: 'transactions', idKey: 'id', newestFirst: true,
+    orderBy: [['created_at', false], ['inserted_at', false], ['id', false]],
+    cacheKey: KEYS.TRANSACTIONS,
+    toRemote: toRemoteTx,
+    fromRemote: (r) => ({
+      id: r.id, amount: toNum(r.amount), description: r.description || '', category: r.category || 'Otro',
+      featherIcon: r.featherIcon || CAT_ICON_MAP[r.category] || 'more-horizontal',
+      type: r.type || 'expense', is_recurring: !!r.is_recurring,
+      created_at: r.created_at, created_by: r.created_by || null,
+    }),
+  },
+  fixed_expenses: {
+    table: 'fixed_expenses', idKey: 'id', newestFirst: false,
+    orderBy: [['inserted_at', true], ['id', true]],
+    cacheKey: KEYS.FIXED_EXPENSES,
+    toRemote: (f) => ({
+      id: f.id, description: f.description, amount: f.amount, category: f.category,
+      feather_icon: f.featherIcon || null, created_by: f.created_by || null,
+    }),
+    fromRemote: (r) => ({
+      id: r.id, description: r.description || '', amount: toNum(r.amount), category: r.category || 'Otro',
+      featherIcon: r.feather_icon || CAT_ICON_MAP[r.category] || 'repeat', created_by: r.created_by || 'Jorge',
+    }),
+  },
+  installments: {
+    table: 'installments', idKey: 'id', newestFirst: false,
+    orderBy: [['inserted_at', true], ['id', true]],
+    cacheKey: KEYS.INSTALLMENTS,
+    toRemote: (i) => ({
+      id: i.id, description: i.description, installment_amount: i.installmentAmount,
+      current_installment: i.currentInstallment, total_installments: i.totalInstallments,
+      created_by: i.created_by || null, created_at: i.created_at || null, category: i.category || null,
+    }),
+    fromRemote: (r) => ({
+      id: r.id, description: r.description || '', installmentAmount: toNum(r.installment_amount),
+      currentInstallment: toNum(r.current_installment), totalInstallments: toNum(r.total_installments) || 1,
+      created_by: r.created_by || 'Jorge', created_at: r.created_at || '', category: r.category || 'Otro',
+    }),
+  },
+  category_budgets: {
+    table: 'category_budgets', idKey: 'category', newestFirst: false, orderBy: [],
+    cacheKey: KEYS.CATEGORY_LIMITS,
+    toRemote: (r) => ({ category: r.category, budget: r.budget }),
+    fromRemote: (r) => ({ category: r.category, budget: toNum(r.budget) }),
+    cacheEncode: (rows) => Object.fromEntries(rows.map(r => [r.category, r.budget])),      // formato de la versión anterior
+    cacheDecode: (map) => Object.entries(map || {}).map(([category, budget]) => ({ category, budget: toNum(budget) })),
+  },
+  global_limits: {
+    table: 'global_limits', idKey: 'key', newestFirst: false, orderBy: [],
+    cacheKey: KEYS.GLOBAL_LIMITS,
+    toRemote: (r) => ({ key: r.key, value: r.value }),
+    fromRemote: (r) => ({ key: r.key, value: toNum(r.value) }),
+    cacheEncode: (rows) => Object.fromEntries(rows.map(r => [r.key, r.value])),
+    cacheDecode: (map) => Object.entries(map || {}).map(([key, value]) => ({ key, value: toNum(value) })),
+  },
+  audit_logs: {
+    table: 'audit_logs', idKey: 'id', newestFirst: true, limit: 200,
+    orderBy: [['created_at', false], ['id', false]],
+    cacheKey: KEYS.AUDIT_LOGS,
+    toRemote: (l) => ({
+      id: l.id, action: l.action, target_desc: l.target_desc, user: l.user || '',
+      amount: l.amount === undefined ? null : l.amount, created_at: l.created_at,
+    }),
+    fromRemote: (r) => ({
+      id: r.id, action: r.action, target_desc: r.target_desc || '', user: r.user || '',
+      amount: r.amount === null || r.amount === undefined ? null : toNum(r.amount), created_at: r.created_at,
+    }),
+  },
 };
 
-let _deleteSyncRunning = false;
+// ── Operaciones sobre las listas (puras: no tocan la pantalla ni la red) ─────
+const upsertLocal = (cfg, list, row) => {
+  const id = row[cfg.idKey];
+  if (list.some(x => x[cfg.idKey] === id)) return list.map(x => (x[cfg.idKey] === id ? row : x));
+  return cfg.newestFirst ? [row, ...list] : [...list, row];
+};
+const removeLocal = (cfg, list, id) => list.filter(x => x[cfg.idKey] !== id);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STORAGE SERVICE  — Supabase primary + AsyncStorage fallback
-// ─────────────────────────────────────────────────────────────────────────────
-const StorageService = {
-  // ── Transactions ──────────────────────────────────────────────────────────
-  //
-  // PATRÓN LOCAL-FIRST:
-  //  1. Cada operación recibe la lista que la pantalla muestra AHORA (baseList) y
-  //     calcula la nueva a partir de ELLA. Antes se releía AsyncStorage, y cuando
-  //     no coincidía con lo que se veía (por ejemplo los datos de ejemplo, que
-  //     nunca se habían guardado) la lista se vaciaba al borrar, editar o agregar.
-  //  2. La lista nueva se guarda en el teléfono y se devuelve a la pantalla.
-  //  3. Supabase se actualiza en segundo plano, sin bloquear la pantalla.
-  //
-  async readLocalTransactions() {
+// Aplica a una lista un evento de Realtime { eventType, new, old } (INSERT, UPDATE o DELETE).
+// En DELETE solo llega la clave primaria en "old": alcanza para saber qué fila quitar.
+const applyChange = (cfg, list, payload) => {
+  if (!payload) return list;
+  if (payload.eventType === 'DELETE') {
+    const id = payload.old ? payload.old[cfg.idKey] : undefined;
+    return id === undefined || id === null ? list : removeLocal(cfg, list, id);
+  }
+  if ((payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') && payload.new) {
+    return upsertLocal(cfg, list, cfg.fromRemote(payload.new));
+  }
+  return list;
+};
+
+// Monta encima de lo que vino de la nube los cambios hechos acá que todavía no se enviaron
+const overlayPending = (cfg, rows, ops) => {
+  let out = rows;
+  ops.filter(o => o.table === cfg.table).forEach(o => {
+    out = o.type === 'delete' ? removeLocal(cfg, out, o.id) : upsertLocal(cfg, out, o.row);
+  });
+  return out;
+};
+
+// Entrada del registro de auditoría (el id lo genera la app: la tabla lo exige)
+const makeAuditEntry = (action, targetDesc, user, amount = null) => ({
+  id: 'log_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+  action,
+  target_desc: targetDesc,
+  user: user || '',                  // el familiar es opcional
+  amount,
+  created_at: new Date().toISOString(),
+});
+
+// Los datos de ejemplo que trae la app NO se suben a la nube (serían datos falsos compartidos)
+const isSampleRow = (name, row) => {
+  const defs = { transactions: DEFAULT_TXS, fixed_expenses: DEFAULT_FIXED_EXPENSES, installments: DEFAULT_INSTALLMENTS }[name];
+  const keys = {
+    transactions:   ['description', 'amount', 'category', 'created_at', 'created_by'],
+    fixed_expenses: ['description', 'amount', 'category', 'created_by'],
+    installments:   ['description', 'installmentAmount', 'currentInstallment', 'totalInstallments', 'created_by'],
+  }[name];
+  if (!defs) return false;
+  const d = defs.find(x => x.id === row.id);
+  return !!d && keys.every(k => String(d[k] ?? '') === String(row[k] ?? ''));
+};
+
+// ── Errores de la nube ───────────────────────────────────────────────────────
+//  'offline' → sin conexión o servicio caído: se reintenta solo
+//  'blocked' → faltan permisos o tablas en Supabase: hay que ejecutar el SQL
+//  'data'    → esa fila tiene datos inválidos: reintentar no sirve
+const classifySyncError = (err) => {
+  if (!err) return null;
+  const code = String(err.code || '');
+  const msg  = String(err.message || '');
+  if (/failed to fetch|network request failed|load failed|networkerror|fetch failed|timeout|timed out/i.test(msg)) return 'offline';
+  if (code === '42501' || err.status === 401 || err.status === 403 ||
+      /row-level security|permission denied|not authorized|jwt/i.test(msg)) return 'blocked';
+  if (code === '42P01' || code === 'PGRST205' || code === 'PGRST204' ||
+      /does not exist|could not find the .*(table|column)|schema cache/i.test(msg)) return 'blocked';
+  if (/^(22|23)/.test(code)) return 'data';
+  return 'offline';
+};
+const friendlySyncError = (kind) => (kind === 'blocked'
+  ? 'La nube no deja guardar: faltan permisos o tablas en Supabase. Hay que ejecutar el archivo SQL de sincronización.'
+  : 'Sin conexión con la nube. Los cambios quedan en el celular y se envían solos cuando vuelva.');
+const describeError = (err) => [err && err.code, err && err.message].filter(Boolean).join(' · ').slice(0, 140);
+
+// Texto, color e ícono del estado de la sincronización (se muestra en Ajustes)
+const describeSync = (s, C) => {
+  const pend = s.pending > 0 ? ` · ${s.pending} por enviar` : '';
+  const fail = s.failed  > 0 ? ` · ${s.failed} rechazado${s.failed > 1 ? 's' : ''}` : '';
+  if (s.phase === 'blocked')  return { title: 'La nube no deja guardar', sub: (s.error || friendlySyncError('blocked')) + pend, detail: s.detail, color: C.negative, icon: 'cloud-off' };
+  if (s.phase === 'offline')  return { title: 'Sin conexión', sub: `Los cambios se guardan en el celular y se envían solos${pend}${fail}`, detail: null, color: C.warn, icon: 'cloud-off' };
+  if (s.phase === 'starting') return { title: 'Conectando…', sub: 'Buscando los datos de la familia', detail: null, color: C.inkMuted, icon: 'cloud' };
+  if (s.realtime === 'live')  return { title: 'Sincronizado en tiempo real', sub: `Lo que cargue cualquiera de la familia se ve al instante${pend}${fail}`, detail: null, color: C.positive, icon: 'cloud' };
+  return { title: 'Conectado', sub: `El tiempo real no está disponible: tocá para actualizar${pend}${fail}`, detail: null, color: C.warn, icon: 'cloud' };
+};
+
+const CloudSync = {
+  // Estado que muestra la pantalla de Ajustes
+  //  phase: 'starting' | 'online' | 'offline' | 'blocked' · realtime: 'connecting' | 'live' | 'down'
+  status: { phase: 'starting', realtime: 'connecting', pending: 0, failed: 0, error: null, detail: null, lastSync: null },
+  _listeners: [],
+  _flushing: false,
+  _retryTimer: null,
+  _retryMs: 15000,
+  _seq: Date.now() * 1000,
+  onRecovered: null,                 // AppShell lo usa para volver a traer datos cuando se recupera la conexión
+
+  subscribeStatus(fn) {
+    CloudSync._listeners.push(fn);
+    try { fn(CloudSync.status); } catch (_) {}
+    return () => { CloudSync._listeners = CloudSync._listeners.filter(f => f !== fn); };
+  },
+  setStatus(patch) {
+    CloudSync.status = { ...CloudSync.status, ...patch };
+    CloudSync._listeners.forEach(f => { try { f(CloudSync.status); } catch (_) {} });
+  },
+
+  // ── Copia local (caché) ───────────────────────────────────────────────────
+  async readCaches() {
+    const out = {};
+    for (const name of Object.keys(SYNC_TABLES)) {
+      const cfg = SYNC_TABLES[name];
+      const raw = await jsonGet(cfg.cacheKey);
+      const rows = raw === null || raw === undefined ? null : (cfg.cacheDecode ? cfg.cacheDecode(raw) : raw);
+      out[name] = Array.isArray(rows) ? rows : null;
+    }
+    return out;
+  },
+  writeCache(name, rows) {
+    const cfg = SYNC_TABLES[name];
+    return jsonSet(cfg.cacheKey, cfg.cacheEncode ? cfg.cacheEncode(rows) : rows);
+  },
+
+  // ── Cola de cambios pendientes ────────────────────────────────────────────
+  async readOutbox() {
+    const v = await jsonGet(KEYS.OUTBOX);
+    return Array.isArray(v) ? v : [];
+  },
+  // El último cambio de cada fila reemplaza a los anteriores (guardar y luego borrar = solo borrar)
+  async enqueueMany(newOps) {
+    const keys = new Set(newOps.map(o => `${o.table}:${o.id}`));
+    const keep = (await CloudSync.readOutbox()).filter(o => !keys.has(`${o.table}:${o.id}`));
+    const ops  = [...keep, ...newOps.map(o => ({ ...o, seq: ++CloudSync._seq }))];
+    await jsonSet(KEYS.OUTBOX, ops);
+    CloudSync.setStatus({ pending: ops.length });
+    return ops;
+  },
+  async removeOp(op) {
+    const ops = (await CloudSync.readOutbox()).filter(o => o.seq !== op.seq);
+    await jsonSet(KEYS.OUTBOX, ops);
+    CloudSync.setStatus({ pending: ops.length });
+  },
+  async addFailed(op, err) {
+    const failed = (await jsonGet(KEYS.OUTBOX_FAILED)) || [];
+    failed.push({ table: op.table, type: op.type, id: op.id, error: describeError(err), at: Date.now() });
+    const kept = failed.slice(-50);
+    await jsonSet(KEYS.OUTBOX_FAILED, kept);
+    CloudSync.setStatus({ failed: kept.length });
+  },
+
+  async sendOp(op) {
+    const cfg = SYNC_TABLES[op.table];
     try {
-      const raw = await AsyncStorage.getItem(KEYS.TRANSACTIONS);
-      const list = raw ? JSON.parse(raw) : null;
-      return Array.isArray(list) ? list : null;
-    } catch (_) { return null; }
+      const req = op.type === 'delete'
+        ? supabase.from(cfg.table).delete().eq(cfg.idKey, op.id)
+        : supabase.from(cfg.table).upsert(cfg.toRemote(op.row), { onConflict: cfg.idKey });
+      const { error } = await req;
+      return error || null;
+    } catch (e) { return e; }
   },
 
-  async writeLocalTransactions(list) {
+  // Envía los pendientes en orden. Si no hay conexión o faltan permisos se detiene sin perder nada.
+  async flush() {
+    if (CloudSync._flushing) return CloudSync.status;
+    CloudSync._flushing = true;
+    let sentAny = false;
     try {
-      await AsyncStorage.setItem(KEYS.TRANSACTIONS, JSON.stringify(list));
-      return true;
-    } catch (_) { return false; }
-  },
-
-  // Envía (crea o actualiza) un gasto a Supabase sin bloquear. upsert sirve para las dos cosas.
-  pushTransaction(tx) {
-    try {
-      supabase.from('transactions').upsert(toRemoteTx(tx))
-        .then(({ error }) => {
-          if (error) console.warn('[FinControl] Supabase no guardó el gasto:', error.message);
-        })
-        .catch(() => {});
-    } catch (_) { /* Supabase no disponible: el gasto ya está a salvo en el teléfono */ }
-  },
-
-  async saveTransaction(tx, baseList) {
-    const base = Array.isArray(baseList) ? baseList : ((await StorageService.readLocalTransactions()) || []);
-    const next = [tx, ...base.filter(t => t.id !== tx.id)];
-    await StorageService.writeLocalTransactions(next);
-    AuditService.logAction('CREADO', tx.description, tx.created_by, tx.amount).catch(() => {});
-    StorageService.pushTransaction(tx);
-    return { data: next, error: null };
-  },
-
-  async updateTransaction(updated, baseList) {
-    const base = Array.isArray(baseList) ? baseList : ((await StorageService.readLocalTransactions()) || []);
-    const next = base.map(t => (t.id === updated.id ? updated : t));
-    await StorageService.writeLocalTransactions(next);
-    AuditService.logAction('EDITADO', updated.description, updated.created_by, updated.amount).catch(() => {});
-    StorageService.pushTransaction(updated);
-    return { data: next, error: null };
-  },
-
-  // ELIMINAR: se quita de la lista que se ve y del teléfono al instante, se anota
-  // el borrado como "pendiente" y se borra en Supabase en segundo plano. Si la nube
-  // no responde, el gasto no vuelve a aparecer y el borrado se reintenta después.
-  async deleteTransaction(id, desc, user, baseList) {
-    const base = Array.isArray(baseList) ? baseList : ((await StorageService.readLocalTransactions()) || []);
-    const next = base.filter(t => t.id !== id);
-    await StorageService.writeLocalTransactions(next);
-    await StorageService.addDeletedId(id);
-    AuditService.logAction('ELIMINADO', desc, user, null).catch(() => {});
-    StorageService.syncPendingDeletes();        // sin await: no hace esperar a la pantalla
-    return { data: next, error: null };
-  },
-
-  // ── Borrados pendientes de confirmar en la nube ───────────────────────────
-  async getDeletedIds() {
-    try {
-      const raw = await AsyncStorage.getItem(KEYS.DELETED_IDS);
-      const ids = raw ? JSON.parse(raw) : [];
-      return Array.isArray(ids) ? ids : [];
-    } catch (_) { return []; }
-  },
-
-  async addDeletedId(id) {
-    try {
-      const ids = await StorageService.getDeletedIds();
-      if (!ids.includes(id)) ids.push(id);
-      await AsyncStorage.setItem(KEYS.DELETED_IDS, JSON.stringify(ids.slice(-500)));
-    } catch (_) {}
-  },
-
-  async removeDeletedIds(done) {
-    try {
-      const ids = (await StorageService.getDeletedIds()).filter(id => !done.includes(id));
-      await AsyncStorage.setItem(KEYS.DELETED_IDS, JSON.stringify(ids));
-    } catch (_) {}
-  },
-
-  // Borra en Supabase los gastos eliminados y COMPRUEBA que hayan desaparecido de verdad:
-  // si faltan permisos (RLS), Supabase no da error pero tampoco borra nada.
-  async syncPendingDeletes() {
-    if (_deleteSyncRunning) return;
-    _deleteSyncRunning = true;
-    try {
-      const ids = await StorageService.getDeletedIds();
-      const done = [];
-      for (const id of ids) {
-        try {
-          const del = await supabase.from('transactions').delete().eq('id', id);
-          if (del.error) {
-            // 22P02 = id con formato inválido: no puede existir en la nube → nada que borrar
-            if (del.error.code === '22P02') done.push(id);
-            else console.warn('[FinControl] Supabase no borró el gasto:', del.error.message);
-            continue;
-          }
-          const check = await supabase.from('transactions').select('id').eq('id', id);
-          if (!check.error && Array.isArray(check.data) && check.data.length === 0) {
-            done.push(id);
-          } else if (!check.error) {
-            console.warn('[FinControl] Supabase no permitió borrar el gasto', id, '(¿falta una política de DELETE?)');
-          }
-        } catch (_) { /* sin conexión: se reintenta en el próximo arranque */ }
+      for (let guard = 0; guard < 2000; guard++) {
+        const ops = await CloudSync.readOutbox();
+        if (ops.length === 0) break;
+        const op  = ops[0];
+        const err = await CloudSync.sendOp(op);
+        if (!err) { sentAny = true; await CloudSync.removeOp(op); continue; }
+        const kind = classifySyncError(err);
+        if (kind === 'data') {                       // dato inválido: se aparta y se sigue con el resto
+          await CloudSync.addFailed(op, err);
+          await CloudSync.removeOp(op);
+          continue;
+        }
+        CloudSync.setStatus({ phase: kind, error: friendlySyncError(kind), detail: describeError(err), pending: ops.length });
+        CloudSync.scheduleRetry();
+        return CloudSync.status;
       }
-      if (done.length) await StorageService.removeDeletedIds(done);
-    } catch (_) {
+      CloudSync._retryMs = 15000;
+      const left = (await CloudSync.readOutbox()).length;
+      CloudSync.setStatus(sentAny ? { phase: 'online', error: null, detail: null, pending: left } : { pending: left });
+      return CloudSync.status;
     } finally {
-      _deleteSyncRunning = false;
+      CloudSync._flushing = false;
     }
   },
-
-  async getTransactions() {
-    const deleted = new Set(await StorageService.getDeletedIds());
-    const local   = await StorageService.readLocalTransactions();      // lista | null
-    let remote = [];
-    try {
-      const { data, error } = await supabase
-        .from('transactions')
-        .select('*')
-        .order('created_at', { ascending: false });
-      if (!error && Array.isArray(data)) remote = data;
-    } catch (_) { /* sin conexión: se usa lo del teléfono */ }
-    if (local === null && remote.length === 0) return { data: null, error: null };   // nada guardado aún
-    return { data: mergeTransactions(local, remote, deleted), error: null };
+  scheduleRetry() {
+    if (CloudSync._retryTimer) return;
+    const wait = CloudSync._retryMs;
+    CloudSync._retryMs = Math.min(CloudSync._retryMs * 2, 120000);
+    CloudSync._retryTimer = setTimeout(async () => {
+      CloudSync._retryTimer = null;
+      const st = await CloudSync.flush();
+      if (st.phase === 'online' && CloudSync.onRecovered) CloudSync.onRecovered();
+    }, wait);
   },
 
-  // ── Category budgets ──────────────────────────────────────────────────────
-  async updateCategoryBudget(category, budget) {
+  // ── Leer de la nube ───────────────────────────────────────────────────────
+  // Lee de a 1000 filas (Supabase corta en 1000 por consulta: sin esto se perderían gastos viejos)
+  async fetchTable(name) {
+    const cfg  = SYNC_TABLES[name];
+    const PAGE = 1000;
+    const max  = cfg.limit || Infinity;
+    let rows = [];
     try {
-      await supabase
-        .from('category_budgets')
-        .upsert({ category, budget }, { onConflict: 'category' });
-    } catch (_) {}
-    try {
-      const raw = await AsyncStorage.getItem(KEYS.CATEGORY_LIMITS);
-      const map = raw ? JSON.parse(raw) : {};
-      map[category] = budget;
-      await AsyncStorage.setItem(KEYS.CATEGORY_LIMITS, JSON.stringify(map));
-      return { data: map, error: null };
-    } catch (e) { return { data: null, error: e }; }
-  },
-
-  async getCategoryBudgets() {
-    try {
-      const { data, error } = await supabase.from('category_budgets').select('*');
-      if (!error && data?.length) {
-        const map = {};
-        data.forEach(r => { map[r.category] = r.budget; });
-        return { data: map, error: null };
+      for (let from = 0; rows.length < max; from += PAGE) {
+        const size = Math.min(PAGE, max - rows.length);
+        let q = supabase.from(cfg.table).select('*');
+        cfg.orderBy.forEach(([col, asc]) => { q = q.order(col, { ascending: asc }); });
+        const { data, error } = await q.range(from, from + size - 1);
+        if (error) return { rows: null, error };
+        const got = data || [];
+        rows = rows.concat(got);
+        if (got.length < size) break;
       }
-    } catch (_) {}
-    try {
-      const raw = await AsyncStorage.getItem(KEYS.CATEGORY_LIMITS);
-      return { data: raw ? JSON.parse(raw) : null, error: null };
-    } catch (e) { return { data: null, error: e }; }
+    } catch (e) { return { rows: null, error: e }; }
+    return { rows: rows.map(cfg.fromRemote), error: null };
+  },
+  // Trae las 6 tablas. Una tabla que falla no afecta a las demás.
+  async fetchAll() {
+    const names   = Object.keys(SYNC_TABLES);
+    const results = await Promise.all(names.map(n => CloudSync.fetchTable(n)));
+    const data = {}; const errors = {};
+    names.forEach((n, i) => { if (results[i].error) errors[n] = results[i].error; else data[n] = results[i].rows; });
+    return { data, errors };
   },
 
-  // ── Global limits ─────────────────────────────────────────────────────────
-  async updateGlobalLimit(key, value) {
-    try {
-      await supabase
-        .from('global_limits')
-        .upsert({ key, value }, { onConflict: 'key' });
-    } catch (_) {}
-    try {
-      const raw = await AsyncStorage.getItem(KEYS.GLOBAL_LIMITS);
-      const map = raw ? JSON.parse(raw) : {};
-      map[key] = value;
-      await AsyncStorage.setItem(KEYS.GLOBAL_LIMITS, JSON.stringify(map));
-      return { data: map, error: null };
-    } catch (e) { return { data: null, error: e }; }
+  // La primera vez, sube lo que ya había guardado en este celular (sin los datos de ejemplo).
+  // Si varios celulares lo hacen, las filas se unen: cada una tiene su propio id.
+  async migrateLocalOnce(caches) {
+    if (await jsonGet(KEYS.CLOUD_MIGRATED)) return 0;
+    const ops = [];
+    for (const name of Object.keys(SYNC_TABLES)) {
+      const cfg  = SYNC_TABLES[name];
+      const rows = caches[name];
+      if (!Array.isArray(rows)) continue;
+      rows.forEach(row => {
+        if (row && !isSampleRow(name, row)) ops.push({ table: name, type: 'upsert', id: row[cfg.idKey], row });
+      });
+    }
+    if (ops.length) await CloudSync.enqueueMany(ops.reverse());     // las más viejas primero
+    await jsonSet(KEYS.CLOUD_MIGRATED, { at: Date.now(), rows: ops.length });
+    return ops.length;
   },
 
-  async getGlobalLimits() {
+  // ── Tiempo real ───────────────────────────────────────────────────────────
+  // Escucha INSERT / UPDATE / DELETE de las 6 tablas. onChange(nombreDeTabla, payload).
+  // onState(status) recibe SUBSCRIBED, CHANNEL_ERROR, TIMED_OUT o CLOSED. Devuelve la función para dejar de escuchar.
+  subscribeRealtime(onChange, onState) {
+    let channel = null;
     try {
-      const { data, error } = await supabase.from('global_limits').select('*');
-      if (!error && data?.length) {
-        const map = {};
-        data.forEach(r => { map[r.key] = r.value; });
-        return { data: map, error: null };
-      }
-    } catch (_) {}
-    try {
-      const raw = await AsyncStorage.getItem(KEYS.GLOBAL_LIMITS);
-      return { data: raw ? JSON.parse(raw) : null, error: null };
-    } catch (e) { return { data: null, error: e }; }
+      channel = supabase.channel('fincontrol-familia');
+      Object.keys(SYNC_TABLES).forEach(name => {
+        channel = channel.on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: SYNC_TABLES[name].table },
+          (payload) => onChange(name, payload),
+        );
+      });
+      channel.subscribe((status, err) => onState(status, err));
+    } catch (e) {
+      onState('CHANNEL_ERROR', e);
+    }
+    return () => { try { if (channel) supabase.removeChannel(channel); } catch (_) {} };
   },
 
-  // ── Prefs ─────────────────────────────────────────────────────────────────
+  // ── Borrar todo (en la nube y en el celular) ─────────────────────────────
+  // Primero la nube: si no hay conexión no se borra nada (así no reaparece lo borrado).
+  // OJO: al estar compartido, esto borra los datos en TODOS los celulares de la familia.
+  async clearEverything() {
+    for (const name of Object.keys(SYNC_TABLES)) {
+      const cfg = SYNC_TABLES[name];
+      let error = null;
+      try { const r = await supabase.from(cfg.table).delete().not(cfg.idKey, 'is', null); error = r.error; } catch (e) { error = e; }
+      if (error) return { ok: false, message: friendlySyncError(classifySyncError(error)), detail: describeError(error) };
+    }
+    try { await AsyncStorage.multiRemove(Object.values(KEYS)); } catch (_) {}
+    CloudSync.setStatus({ pending: 0, failed: 0 });
+    return { ok: true };
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALMACÉN CENTRAL DE DATOS (estado compartido de la app)
+//
+// Guarda las 6 listas, aplica los cambios hechos en este celular (mutate), los que
+// llegan de otros celulares por Realtime (applyRealtime) y los que se traen de la nube
+// (fetchData). Las pantallas lo leen con useDataStore(): todo se mantiene sincronizado.
+// ─────────────────────────────────────────────────────────────────────────────
+const initialData = () => ({
+  transactions: DEFAULT_TXS, fixed_expenses: DEFAULT_FIXED_EXPENSES, installments: DEFAULT_INSTALLMENTS,
+  category_budgets: [], global_limits: [], audit_logs: [],
+});
+const emptyData = () => ({
+  transactions: [], fixed_expenses: [], installments: [], category_budgets: [], global_limits: [], audit_logs: [],
+});
+
+const DataStore = {
+  data: null,
+  _listeners: [],
+
+  get() { if (!DataStore.data) DataStore.data = initialData(); return DataStore.data; },
+  subscribe(fn) {
+    DataStore._listeners.push(fn);
+    return () => { DataStore._listeners = DataStore._listeners.filter(f => f !== fn); };
+  },
+  _emit() { DataStore._listeners.forEach(f => { try { f(DataStore.data); } catch (_) {} }); },
+
+  // Reemplaza la lista de una tabla: pantalla + copia local en el celular
+  commit(name, rows, opts = {}) {
+    const cfg  = SYNC_TABLES[name];
+    const next = cfg.limit ? rows.slice(0, cfg.limit) : rows;
+    DataStore.data = { ...DataStore.get(), [name]: next };
+    if (opts.cache !== false) CloudSync.writeCache(name, next);
+    DataStore._emit();
+  },
+
+  // Cambio hecho en ESTE celular. Primero se anota en la cola (así un "traer datos" no lo pisa),
+  // después se ve en pantalla, y se envía a la nube sin hacer esperar a nadie.
+  async mutate(name, op) {
+    const cfg = SYNC_TABLES[name];
+    const id  = op.type === 'delete' ? op.id : op.row[cfg.idKey];
+    await CloudSync.enqueueMany([{ table: name, type: op.type, id, row: op.row }]);
+    const cur = DataStore.get()[name];
+    DataStore.commit(name, op.type === 'delete' ? removeLocal(cfg, cur, id) : upsertLocal(cfg, cur, op.row));
+    CloudSync.flush().catch(() => {});
+  },
+
+  // ── Acciones de la app ────────────────────────────────────────────────────
+  audit(action, desc, user, amount) {
+    return DataStore.mutate('audit_logs', { type: 'upsert', row: makeAuditEntry(action, desc, user, amount) });
+  },
+  async addTransaction(tx) {
+    await DataStore.mutate('transactions', { type: 'upsert', row: tx });
+    await DataStore.audit('CREADO', tx.description, tx.created_by, tx.amount);
+  },
+  async updateTransaction(tx) {
+    await DataStore.mutate('transactions', { type: 'upsert', row: tx });
+    await DataStore.audit('EDITADO', tx.description, tx.created_by, tx.amount);
+  },
+  async deleteTransaction(tx) {
+    await DataStore.mutate('transactions', { type: 'delete', id: tx.id });
+    await DataStore.audit('ELIMINADO', tx.description, tx.created_by, null);
+  },
+  saveFixed(item)          { return DataStore.mutate('fixed_expenses', { type: 'upsert', row: item }); },
+  deleteFixed(id)          { return DataStore.mutate('fixed_expenses', { type: 'delete', id }); },
+  saveInstallment(item)    { return DataStore.mutate('installments',   { type: 'upsert', row: item }); },
+  deleteInstallment(id)    { return DataStore.mutate('installments',   { type: 'delete', id }); },
+  setCategoryBudget(category, budget) { return DataStore.mutate('category_budgets', { type: 'upsert', row: { category, budget } }); },
+  setGlobalLimit(key, value)          { return DataStore.mutate('global_limits',    { type: 'upsert', row: { key, value } }); },
+
+  // Cambio que llegó de otro celular por Realtime
+  async applyRealtime(name, payload) {
+    const cfg = SYNC_TABLES[name];
+    const src = payload && (payload.eventType === 'DELETE' ? payload.old : payload.new);
+    const id  = src ? src[cfg.idKey] : undefined;
+    // Si hay un cambio MÍO sin enviar sobre esa misma fila, manda el mío
+    const pending = await CloudSync.readOutbox();
+    if (pending.some(o => o.table === name && o.id === id)) return;
+    DataStore.commit(name, applyChange(cfg, DataStore.get()[name], payload));
+  },
+
+  // Trae las 6 tablas de la nube y deja la pantalla igual que la nube (más lo que falte enviar)
+  async fetchData() {
+    const { data: fetched, errors } = await CloudSync.fetchAll();
+    const pending = await CloudSync.readOutbox();      // se lee DESPUÉS de la red: incluye lo anotado mientras tanto
+    Object.keys(fetched).forEach(name => {
+      DataStore.commit(name, overlayPending(SYNC_TABLES[name], fetched[name], pending));
+    });
+    const bad = Object.keys(errors);
+    if (bad.length === 0) {
+      const keepError = pending.length > 0 && (CloudSync.status.phase === 'blocked' || CloudSync.status.phase === 'offline');
+      CloudSync.setStatus(keepError
+        ? { lastSync: Date.now(), pending: pending.length }
+        : { phase: 'online', error: null, detail: null, lastSync: Date.now(), pending: pending.length });
+    } else {
+      const kind = classifySyncError(errors[bad[0]]);
+      CloudSync.setStatus({
+        phase: kind === 'data' ? 'online' : kind, error: friendlySyncError(kind),
+        detail: describeError(errors[bad[0]]), pending: pending.length,
+      });
+    }
+    return { errors };
+  },
+
+  // Sincronizar ahora (botón de Ajustes)
+  async syncNow() {
+    await CloudSync.flush();
+    return DataStore.fetchData();
+  },
+
+  // Arranque: 1) muestra lo guardado en el celular · 2) sube lo viejo una sola vez ·
+  // 3) envía pendientes y trae lo último de la nube · 4) escucha los cambios en tiempo real.
+  // Devuelve la función para detener todo.
+  start(onLocalReady) {
+    let stopped = false;
+    const cleanups = [];
+
+    (async () => {
+      const caches = await CloudSync.readCaches();
+      if (stopped) return;
+      Object.keys(caches).forEach(name => { if (caches[name]) DataStore.commit(name, caches[name], { cache: false }); });
+      if (onLocalReady) onLocalReady();
+      await CloudSync.migrateLocalOnce(caches);
+      await CloudSync.flush();
+      if (!stopped) await DataStore.fetchData();
+    })().catch(() => { if (onLocalReady && !stopped) onLocalReady(); });
+
+    CloudSync.onRecovered = () => { DataStore.fetchData().catch(() => {}); };
+
+    // Tiempo real: cada INSERT / UPDATE / DELETE de otro celular se aplica a la pantalla
+    cleanups.push(CloudSync.subscribeRealtime(
+      (name, payload) => { DataStore.applyRealtime(name, payload).catch(() => {}); },
+      (status) => {
+        if (status === 'SUBSCRIBED') {
+          CloudSync.setStatus({ realtime: 'live' });
+          CloudSync.flush().then(() => DataStore.fetchData()).catch(() => {});   // al (re)conectar se pone al día
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+          CloudSync.setStatus({ realtime: 'down' });
+        }
+      },
+    ));
+
+    // Al volver a la app o recuperar internet se envían los pendientes y se trae lo último
+    const resync = () => { CloudSync.flush().then(() => DataStore.fetchData()).catch(() => {}); };
+    try {
+      const sub = AppState.addEventListener('change', (s) => { if (s === 'active') resync(); });
+      cleanups.push(() => { if (sub && sub.remove) sub.remove(); });
+    } catch (_) {}
+    if (Platform.OS === 'web' && typeof window !== 'undefined' && window.addEventListener) {
+      window.addEventListener('online', resync);
+      cleanups.push(() => window.removeEventListener('online', resync));
+    }
+
+    return () => {
+      stopped = true;
+      cleanups.forEach(f => { try { f(); } catch (_) {} });
+      CloudSync.onRecovered = null;
+    };
+  },
+
+  // Borrar todo (nube + celulares). Devuelve { ok, message }
+  async clearAll() {
+    const res = await CloudSync.clearEverything();
+    if (res.ok) { DataStore.data = emptyData(); DataStore._emit(); }
+    return res;
+  },
+};
+
+// Hooks: las pantallas leen el estado compartido y el estado de la sincronización
+const useDataStore = () => {
+  const [data, setData] = useState(() => DataStore.get());
+  useEffect(() => { setData(DataStore.get()); return DataStore.subscribe(setData); }, []);
+  return data;
+};
+const useSyncStatus = () => {
+  const [status, setStatus] = useState(CloudSync.status);
+  useEffect(() => CloudSync.subscribeStatus(setStatus), []);
+  return status;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STORAGE SERVICE — solo las preferencias de ESTE celular (todo lo demás va por CloudSync)
+// ─────────────────────────────────────────────────────────────────────────────
+const StorageService = {
   async getPrefs() {
     try {
       const raw = await AsyncStorage.getItem(KEYS.PREFS);
@@ -455,44 +751,6 @@ const StorageService = {
   async savePrefs(prefs) {
     try {
       await AsyncStorage.setItem(KEYS.PREFS, JSON.stringify(prefs));
-      return { error: null };
-    } catch (e) { return { error: e }; }
-  },
-
-  // ── Fixed expenses ────────────────────────────────────────────────────────
-  async getFixedExpenses() {
-    try {
-      const raw = await AsyncStorage.getItem(KEYS.FIXED_EXPENSES);
-      return { data: raw ? JSON.parse(raw) : null, error: null };
-    } catch (e) { return { data: null, error: e }; }
-  },
-
-  async saveFixedExpenses(list) {
-    try {
-      await AsyncStorage.setItem(KEYS.FIXED_EXPENSES, JSON.stringify(list));
-      return { error: null };
-    } catch (e) { return { error: e }; }
-  },
-
-  // ── Installments (cuotas) ─────────────────────────────────────────────────
-  async getInstallments() {
-    try {
-      const raw = await AsyncStorage.getItem(KEYS.INSTALLMENTS);
-      return { data: raw ? JSON.parse(raw) : null, error: null };
-    } catch (e) { return { data: null, error: e }; }
-  },
-
-  async saveInstallments(list) {
-    try {
-      await AsyncStorage.setItem(KEYS.INSTALLMENTS, JSON.stringify(list));
-      return { error: null };
-    } catch (e) { return { error: e }; }
-  },
-
-  async clearAll() {
-    try { await supabase.from('transactions').delete().neq('id', ''); } catch (_) {}
-    try {
-      await AsyncStorage.multiRemove(Object.values(KEYS));
       return { error: null };
     } catch (e) { return { error: e }; }
   },
@@ -3706,7 +3964,7 @@ function FixedExpenseFormModal({ visible, onClose, onSave, editItem, C }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // SCREEN: GASTOS FIJOS
 // ─────────────────────────────────────────────────────────────────────────────
-function FixedExpensesScreen({ fixedExpenses, setFixedExpenses, onAddToTransactions, C }) {
+function FixedExpensesScreen({ fixedExpenses, onSaveFixed, onDeleteFixed, onAddToTransactions, C }) {
   const st = mkSt(C);
   const [formVisible, setFormVisible] = useState(false);
   const [editItem,    setEditItem]    = useState(null);
@@ -3715,12 +3973,7 @@ function FixedExpensesScreen({ fixedExpenses, setFixedExpenses, onAddToTransacti
   const totalFixed = fixedExpenses.reduce((a, fe) => a + fe.amount, 0);
 
   const handleSave = async (item) => {
-    const isEdit = fixedExpenses.some(f => f.id === item.id);
-    const next   = isEdit
-      ? fixedExpenses.map(f => f.id === item.id ? item : f)
-      : [...fixedExpenses, item];
-    setFixedExpenses(next);
-    await StorageService.saveFixedExpenses(next);
+    await onSaveFixed(item);          // se guarda en la nube y les llega al instante a los demás celulares
     setFormVisible(false);
     setEditItem(null);
   };
@@ -3733,9 +3986,7 @@ function FixedExpensesScreen({ fixedExpenses, setFixedExpenses, onAddToTransacti
         { text: 'Cancelar', style: 'cancel' },
         {
           text: 'Eliminar', style: 'destructive', onPress: async () => {
-            const next = fixedExpenses.filter(f => f.id !== item.id);
-            setFixedExpenses(next);
-            await StorageService.saveFixedExpenses(next);
+            await onDeleteFixed(item.id);
           },
         },
       ]
@@ -4026,7 +4277,7 @@ function InstallmentFormModal({ visible, onClose, onSave, editItem, C }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // SCREEN: CONTROL DE CUOTAS
 // ─────────────────────────────────────────────────────────────────────────────
-function InstallmentsScreen({ installments, setInstallments, onAddToTransactions, C }) {
+function InstallmentsScreen({ installments, onSaveInstallment, onDeleteInstallment, onAddToTransactions, C }) {
   const st = mkSt(C);
   const [formVisible, setFormVisible] = useState(false);
   const [editItem,    setEditItem]    = useState(null);
@@ -4038,12 +4289,7 @@ function InstallmentsScreen({ installments, setInstallments, onAddToTransactions
   }, 0);
 
   const handleSave = async (item) => {
-    const isEdit = installments.some(i => i.id === item.id);
-    const next   = isEdit
-      ? installments.map(i => i.id === item.id ? item : i)
-      : [...installments, item];
-    setInstallments(next);
-    await StorageService.saveInstallments(next);
+    await onSaveInstallment(item);    // se guarda en la nube y les llega al instante a los demás celulares
     setFormVisible(false);
     setEditItem(null);
   };
@@ -4077,10 +4323,7 @@ function InstallmentsScreen({ installments, setInstallments, onAddToTransactions
             await onAddToTransactions(tx);
 
             // Avanzar la cuota
-            const updated = { ...inst, currentInstallment: nextCuota };
-            const next    = installments.map(i => i.id === inst.id ? updated : i);
-            setInstallments(next);
-            await StorageService.saveInstallments(next);
+            await onSaveInstallment({ ...inst, currentInstallment: nextCuota });
 
             showAlert(
               '✅ Cuota registrada',
@@ -4102,9 +4345,7 @@ function InstallmentsScreen({ installments, setInstallments, onAddToTransactions
         { text: 'Cancelar', style: 'cancel' },
         {
           text: 'Eliminar', style: 'destructive', onPress: async () => {
-            const next = installments.filter(i => i.id !== inst.id);
-            setInstallments(next);
-            await StorageService.saveInstallments(next);
+            await onDeleteInstallment(inst.id);
           },
         },
       ]
@@ -4275,9 +4516,9 @@ function InstallmentsScreen({ installments, setInstallments, onAddToTransactions
 // SCREEN: LÍMITES  — ahora con 3 pestañas: Límites / Gastos Fijos / Cuotas
 // FIX #2: LimitRow en scope global
 // ─────────────────────────────────────────────────────────────────────────────
-function LimitsScreen({ catBudgets, setCatBudgets, globalLimits, setGlobalLimits,
-                        fixedExpenses, setFixedExpenses,
-                        installments, setInstallments,
+function LimitsScreen({ catBudgets, onSetCategoryBudget, globalLimits, onSetGlobalLimit,
+                        fixedExpenses, onSaveFixed, onDeleteFixed,
+                        installments, onSaveInstallment, onDeleteInstallment,
                         onAddToTransactions, C }) {
   const st        = mkSt(C);
   const [activeTab, setActiveTab] = useState('limits'); // 'limits' | 'fixed' | 'cuotas'
@@ -4304,16 +4545,12 @@ function LimitsScreen({ catBudgets, setCatBudgets, globalLimits, setGlobalLimits
     const val = parseAmount(draft);                 // "1.234,56" → 1234.56
     if (!val || val <= 0) { showAlert('Valor inválido', 'Ingresá un número mayor a 0.'); return; }
     if (editId === 'monthly' || editId === 'fixed' || editId === 'daily') {
-      const next = { ...globalLimits, [editId]: val };
-      setGlobalLimits(next);
-      await StorageService.updateGlobalLimit(editId, val);
+      await onSetGlobalLimit(editId, val);        // se guarda en la nube y les llega a los demás celulares
     } else {
-      const next = catBudgets.map(c => c.category === editId ? { ...c, budget: val } : c);
-      setCatBudgets(next);
-      await StorageService.updateCategoryBudget(editId, val);
+      await onSetCategoryBudget(editId, val);
     }
     setEditId(null); setDraft(''); showSaved();
-  }, [draft, editId, globalLimits, catBudgets]);
+  }, [draft, editId, onSetGlobalLimit, onSetCategoryBudget]);
 
   const GLOBAL_ITEMS = [
     { id: 'monthly', label: 'Límite mensual total',       icon: 'calendar', value: globalLimits.monthly },
@@ -4402,7 +4639,8 @@ function LimitsScreen({ catBudgets, setCatBudgets, globalLimits, setGlobalLimits
       {activeTab === 'fixed' && (
         <FixedExpensesScreen
           fixedExpenses={fixedExpenses}
-          setFixedExpenses={setFixedExpenses}
+          onSaveFixed={onSaveFixed}
+          onDeleteFixed={onDeleteFixed}
           onAddToTransactions={onAddToTransactions}
           C={C}
         />
@@ -4412,7 +4650,8 @@ function LimitsScreen({ catBudgets, setCatBudgets, globalLimits, setGlobalLimits
       {activeTab === 'cuotas' && (
         <InstallmentsScreen
           installments={installments}
-          setInstallments={setInstallments}
+          onSaveInstallment={onSaveInstallment}
+          onDeleteInstallment={onDeleteInstallment}
           onAddToTransactions={onAddToTransactions}
           C={C}
         />
@@ -4424,16 +4663,8 @@ function LimitsScreen({ catBudgets, setCatBudgets, globalLimits, setGlobalLimits
 // ─────────────────────────────────────────────────────────────────────────────
 // AUDIT LOG MODAL
 // ─────────────────────────────────────────────────────────────────────────────
-function AuditLogModal({ visible, onClose, C }) {
+function AuditLogModal({ visible, onClose, logs, C }) {
   const st = mkSt(C);
-  const [logs,    setLogs]    = useState([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    if (!visible) return;
-    setLoading(true);
-    AuditService.getLogs().then(({ data }) => { setLogs(data || []); setLoading(false); });
-  }, [visible]);
 
   const ACTION_META = {
     'CREADO':   { color: LIGHT.positive, icon: 'plus-circle' },
@@ -4463,11 +4694,7 @@ function AuditLogModal({ visible, onClose, C }) {
           </TouchableOpacity>
         </View>
 
-        {loading ? (
-          <View style={{ height: 200, alignItems: 'center', justifyContent: 'center' }}>
-            <ActivityIndicator size="large" color={C.accent} />
-          </View>
-        ) : logs.length === 0 ? (
+        {logs.length === 0 ? (
           <View style={[st.auditEmpty, { paddingBottom: 40 }]}>
             <Feather name="clock" size={32} color={C.inkFaint} />
             <Text style={st.auditEmptyTxt}>
@@ -4725,10 +4952,18 @@ function ReportsModal({ visible, onClose, transactions, C }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // SCREEN: AJUSTES
 // ─────────────────────────────────────────────────────────────────────────────
-function ConfigScreen({ prefs, setPrefs, onLogout, onClearAll, transactions, C }) {
+function ConfigScreen({ prefs, setPrefs, onLogout, onClearAll, transactions, auditLogs, syncStatus, onSyncNow, C }) {
   const st = mkSt(C);
   const [auditModal,     setAuditModal]     = useState(false);
   const [reportsModal,   setReportsModal]   = useState(false);
+  const [syncing,        setSyncing]        = useState(false);
+
+  // Estado de la sincronización con la familia + botón "sincronizar ahora"
+  const sync = describeSync(syncStatus, C);
+  const handleSyncNow = async () => {
+    setSyncing(true);
+    try { await onSyncNow(); } finally { setSyncing(false); }
+  };
 
   const toggle = async (key) => {
     const next = { ...prefs, [key]: !prefs[key] };
@@ -4739,14 +4974,14 @@ function ConfigScreen({ prefs, setPrefs, onLogout, onClearAll, transactions, C }
   const handleClearAll = () => {
     showAlert(
       '¿Borrar todos los datos?',
-      'Se eliminarán todos los movimientos, límites y el historial de auditoría.',
+      'Se eliminarán todos los movimientos, gastos fijos, cuotas, límites y el historial de auditoría de TODOS los celulares de la familia, porque los datos están compartidos en la nube.',
       [
         { text: 'Cancelar', style: 'cancel' },
         {
           text: 'Continuar', style: 'destructive', onPress: () => {
             showAlert(
               'Confirmación final',
-              '¿Estás seguro? Esta acción es irreversible.',
+              '¿Estás seguro? Esta acción es irreversible y afecta a todos los dispositivos.',
               [
                 { text: 'Cancelar', style: 'cancel' },
                 { text: 'BORRAR TODO', style: 'destructive', onPress: onClearAll },
@@ -4836,6 +5071,30 @@ function ConfigScreen({ prefs, setPrefs, onLogout, onClearAll, transactions, C }
         {/* Datos */}
         <Text style={st.configSectionHdr}>Datos</Text>
         <View style={st.configGroup}>
+          {/* Sincronización con la familia: estado en vivo y botón para sincronizar ahora */}
+          <TouchableOpacity
+            style={[st.configRow, st.configRowBorder]}
+            onPress={handleSyncNow}
+            disabled={syncing}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="Sincronizar ahora"
+          >
+            <View style={st.configRowLeft}>
+              <View style={[st.configRowIconWrap, { backgroundColor: sync.color + '22' }]}>
+                <Feather name={sync.icon} size={16} color={sync.color} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={[st.configRowLabel, { color: sync.color }]}>{sync.title}</Text>
+                <Text style={st.configRowSub}>{sync.sub}</Text>
+                {sync.detail ? <Text style={[st.configRowSub, { fontSize: F.xs }]}>{sync.detail}</Text> : null}
+              </View>
+            </View>
+            {syncing
+              ? <ActivityIndicator size="small" color={C.accent} />
+              : <Feather name="refresh-cw" size={16} color={C.inkFaint} />}
+          </TouchableOpacity>
+
           {/* Auditoría */}
           <TouchableOpacity style={[st.configRow, st.configRowBorder]} onPress={() => setAuditModal(true)}>
             <View style={st.configRowLeft}>
@@ -4869,8 +5128,8 @@ function ConfigScreen({ prefs, setPrefs, onLogout, onClearAll, transactions, C }
             <Feather name="chevron-right" size={16} color={C.inkFaint} />
           </TouchableOpacity>
         </View>
-        {/* Nota: la sincronización con Supabase ocurre automáticamente en background
-            al crear, editar o eliminar gastos. No requiere acción manual. */}
+        {/* Nota: los datos se comparten en la nube (Supabase) y se actualizan solos en todos
+            los celulares en tiempo real. El botón "Sincronizar" solo fuerza una actualización. */}
 
         {/* Zona de peligro */}
         <Text style={st.configSectionHdr}>Zona de peligro</Text>
@@ -4908,7 +5167,7 @@ function ConfigScreen({ prefs, setPrefs, onLogout, onClearAll, transactions, C }
         <View style={{ height: 40 }} />
       </ScrollView>
 
-      <AuditLogModal visible={auditModal} onClose={() => setAuditModal(false)} C={C} />
+      <AuditLogModal visible={auditModal} onClose={() => setAuditModal(false)} logs={auditLogs || []} C={C} />
       <ReportsModal  visible={reportsModal} onClose={() => setReportsModal(false)} transactions={transactions} C={C} />
     </View>
   );
@@ -4925,78 +5184,48 @@ const NAV = [
 ];
 
 function AppShell({ onLogout, initialPrefs, onPrefsChange }) {
-  const [tab,            setTab]           = useState('home');
-  const [transactions,   setTransactions]  = useState(DEFAULT_TXS);
-  // La lista MÁS RECIENTE de gastos, siempre al día (React tarda un instante en
-  // actualizar el estado). Todas las operaciones parten de ella, así nunca se
-  // trabaja sobre una lista vieja ni se pierde un gasto al cargar varios seguidos.
-  const txRef = useRef(DEFAULT_TXS);
-  const commitTransactions = useCallback((next) => { txRef.current = next; setTransactions(next); }, []);
-  const [catBudgets,     setCatBudgets]    = useState(DEFAULT_CATS);
-  const [globalLimits,   setGlobalLimits]  = useState(DEFAULT_GLOBAL);
-  const [prefs,          setPrefs]         = useState({ ...DEFAULT_PREFS, ...(initialPrefs || {}) });
-  const [fixedExpenses,  setFixedExpenses] = useState(DEFAULT_FIXED_EXPENSES);
-  const [installments,   setInstallments]  = useState(DEFAULT_INSTALLMENTS);
-  const [loading,        setLoading]       = useState(true);
+  const [tab,     setTab]     = useState('home');
+  const [prefs,   setPrefs]   = useState({ ...DEFAULT_PREFS, ...(initialPrefs || {}) });
+  const [loading, setLoading] = useState(true);
 
-  // Hidratación desde AsyncStorage al iniciar
+  // Datos COMPARTIDOS de la familia. Salen del almacén central (DataStore), que los mantiene
+  // sincronizados con Supabase: lo que cargue cualquiera aparece solo en todos los celulares.
+  const data          = useDataStore();
+  const syncStatus    = useSyncStatus();
+  const transactions  = data.transactions;
+  const fixedExpenses = data.fixed_expenses;
+  const installments  = data.installments;
+  const auditLogs     = data.audit_logs;
+  // Presupuestos: los de la nube pisan a los que trae la app por defecto
+  const catBudgets = useMemo(() => DEFAULT_CATS.map(c => {
+    const row = data.category_budgets.find(r => r.category === c.category);
+    return row ? { ...c, budget: row.budget } : c;
+  }), [data.category_budgets]);
+  const globalLimits = useMemo(() => {
+    const g = { ...DEFAULT_GLOBAL };
+    data.global_limits.forEach(r => { g[r.key] = r.value; });
+    return g;
+  }, [data.global_limits]);
+
+  // Arranque: preferencias de ESTE celular + datos (primero lo guardado acá, después la nube,
+  // y por último se queda escuchando los cambios en tiempo real)
   useEffect(() => {
-    (async () => {
-      const [txR, catR, globR, prefsR, feR, instR] = await Promise.all([
-        StorageService.getTransactions(),
-        StorageService.getCategoryBudgets(),
-        StorageService.getGlobalLimits(),
-        StorageService.getPrefs(),
-        StorageService.getFixedExpenses(),
-        StorageService.getInstallments(),
-      ]);
-      if (txR.data)    commitTransactions(txR.data);
-      if (catR.data)   setCatBudgets(DEFAULT_CATS.map(c => ({ ...c, budget: catR.data[c.category] ?? c.budget })));
-      if (globR.data)  setGlobalLimits(g => ({ ...g, ...globR.data }));
-      if (prefsR.data) setPrefs(p => ({ ...p, ...prefsR.data }));
-      if (feR.data)    setFixedExpenses(feR.data);
-      if (instR.data)  setInstallments(instR.data);
-      setLoading(false);
-      StorageService.syncPendingDeletes();     // reintenta borrados que hayan quedado pendientes en la nube
-    })();
+    let alive = true;
+    StorageService.getPrefs().then(r => { if (alive && r.data) setPrefs(p => ({ ...p, ...r.data })); });
+    const stop = DataStore.start(() => { if (alive) setLoading(false); });
+    return () => { alive = false; stop(); };
   }, []);
 
-  // ── Operaciones sobre los gastos ──────────────────────────────────────────
-  // 1) La pantalla se actualiza AL INSTANTE con la lista nueva.
-  // 2) Se guarda en el teléfono y se sincroniza con Supabase en segundo plano.
-  // (se le pasa a StorageService la lista ya actualizada: repetir la operación es inofensivo)
-  const addTransaction = useCallback(async (tx) => {
-    const next = [tx, ...txRef.current.filter(t => t.id !== tx.id)];
-    commitTransactions(next);
-    await StorageService.saveTransaction(tx, next);
-  }, [commitTransactions]);
-
-  const updateTransaction = useCallback(async (tx) => {
-    const next = txRef.current.map(t => (t.id === tx.id ? tx : t));
-    commitTransactions(next);
-    await StorageService.updateTransaction(tx, next);
-  }, [commitTransactions]);
-
-  const deleteTransaction = useCallback(async (tx) => {
-    const next = txRef.current.filter(t => t.id !== tx.id);      // solo ese gasto
-    commitTransactions(next);
-    await StorageService.deleteTransaction(tx.id, tx.description, tx.created_by, next);
-  }, [commitTransactions]);
-
-  // Gastos fijos y cuotas usan el mismo camino que "agregar gasto"
-  const handleAddToTransactions = addTransaction;
-
+  // Borra TODO en la nube y en el celular (se vacía también en los demás celulares)
   const handleClearAll = async () => {
-    await StorageService.clearAll();
-    await AuditService.clearLogs();
-    commitTransactions([]);
-    setCatBudgets(DEFAULT_CATS);
-    setGlobalLimits(DEFAULT_GLOBAL);
+    const res = await DataStore.clearAll();
+    if (!res.ok) {
+      showAlert('No se pudo borrar', `${res.message}\n\nNo se borró nada.`);
+      return;
+    }
     setPrefs(DEFAULT_PREFS);
-    setFixedExpenses(DEFAULT_FIXED_EXPENSES);
-    setInstallments(DEFAULT_INSTALLMENTS);
     setTab('home');
-    showAlert('Datos eliminados', 'La app fue reiniciada correctamente.');
+    showAlert('Datos eliminados', 'La app fue reiniciada. Los datos se borraron en todos los celulares de la familia.');
   };
 
   // Mantiene al día las preferencias en la raíz (así, al cerrar sesión y volver
@@ -5029,9 +5258,9 @@ function AppShell({ onLogout, initialPrefs, onPrefsChange }) {
         {tab === 'home'   && (
           <DashboardScreen
             transactions={transactions}
-            onAdd={addTransaction}
-            onUpdate={updateTransaction}
-            onDelete={deleteTransaction}
+            onAdd={DataStore.addTransaction}
+            onUpdate={DataStore.updateTransaction}
+            onDelete={DataStore.deleteTransaction}
             catBudgets={catBudgets}
             globalLimits={globalLimits}
             C={C}
@@ -5047,14 +5276,16 @@ function AppShell({ onLogout, initialPrefs, onPrefsChange }) {
         {tab === 'limits' && (
           <LimitsScreen
             catBudgets={catBudgets}
-            setCatBudgets={setCatBudgets}
+            onSetCategoryBudget={DataStore.setCategoryBudget}
             globalLimits={globalLimits}
-            setGlobalLimits={setGlobalLimits}
+            onSetGlobalLimit={DataStore.setGlobalLimit}
             fixedExpenses={fixedExpenses}
-            setFixedExpenses={setFixedExpenses}
+            onSaveFixed={DataStore.saveFixed}
+            onDeleteFixed={DataStore.deleteFixed}
             installments={installments}
-            setInstallments={setInstallments}
-            onAddToTransactions={handleAddToTransactions}
+            onSaveInstallment={DataStore.saveInstallment}
+            onDeleteInstallment={DataStore.deleteInstallment}
+            onAddToTransactions={DataStore.addTransaction}
             C={C}
           />
         )}
@@ -5065,6 +5296,9 @@ function AppShell({ onLogout, initialPrefs, onPrefsChange }) {
             onLogout={onLogout}
             onClearAll={handleClearAll}
             transactions={transactions}
+            auditLogs={auditLogs}
+            syncStatus={syncStatus}
+            onSyncNow={DataStore.syncNow}
             C={C}
           />
         )}
