@@ -5,8 +5,7 @@
 //  1. useNativeDriver: separación estricta — scrollY siempre false,
 //     transform/opacity siempre true. Sin mezcla en el mismo nodo.
 //  2. LimitRow extraído a scope global (evita desmount de TextInput).
-//  3. KeyboardAvoidingView: behavior padding solo en iOS, undefined en Android.
-//     ScrollView con keyboardShouldPersistTaps="handled" en todos los modales.
+//  3. (Reemplazado por el punto 21) Hojas de formulario con alto máximo real y pie fijo.
 //  4. AI zone rediseñada en columna vertical — sin superposiciones.
 //  5. Header usa paddingTop en ScrollView (no position:absolute que bloquea).
 //     zIndex y pointerEvents revisados para no bloquear toques.
@@ -40,6 +39,11 @@
 //     Supabase Auth y "Recordar en este dispositivo" (guarda la sesión, nunca la contraseña).
 //     Los campos arrancan vacíos y sin sugerencias. Sin inicio con Google. El Inicio ya no
 //     muestra el gasto por persona y el modal de gastos tiene una cruz para cerrarlo.
+// 21. Celular / PWA: la clave de Groq sale de la variable de entorno EXPO_PUBLIC_GROQ_API_KEY
+//     (ya no está escrita en el código). Hojas de formulario (gasto, gasto fijo, cuota) con alto
+//     máximo real, botón de guardar en un pie fijo y teclado manejado (iOS/Android y web con
+//     visualViewport). La página no se desplaza ni rebota ni hace zoom; solo se desplazan las
+//     listas y los formularios.
 // 18. Informes: el Excel lleva el formato como atributos HTML (los programas de hojas de
 //     cálculo ignoran el CSS) y el PDF suma el logo y las tarjetas de métricas destacadas.
 // 19. Familia sincronizada: gastos, gastos fijos, cuotas, presupuestos, límites y auditoría
@@ -59,7 +63,7 @@ import {
   View, Text, ScrollView, TouchableOpacity, TouchableWithoutFeedback,
   TextInput, StyleSheet, Animated, Dimensions, KeyboardAvoidingView,
   Platform, StatusBar, Modal, Alert, SafeAreaView,
-  ActivityIndicator, Switch, Share, AppState,
+  ActivityIndicator, Switch, Share, AppState, useWindowDimensions,
 } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -961,13 +965,26 @@ const AuthService = {
 // ─────────────────────────────────────────────────────────────────────────────
 // GROQ + AI SERVICE — interpreta la frase dictada (API gratuita, formato OpenAI)
 //
-// SEGURIDAD: una clave escrita dentro de la app se puede extraer del paquete
-// instalado. Conviene regenerarla si se comparte, y a futuro lo más seguro es
-// llamar a Groq desde una Edge Function de Supabase y dejar la clave solo en el
-// servidor (eso además evita cualquier bloqueo del navegador por CORS).
+// LA CLAVE NO ESTÁ ESCRITA EN EL CÓDIGO: se lee de la variable de entorno
+// EXPO_PUBLIC_GROQ_API_KEY.
+//   · En tu compu: archivo .env.local (con ".env*.local" en el .gitignore):
+//         EXPO_PUBLIC_GROQ_API_KEY=tu_clave
+//   · En Vercel: Settings → Environment Variables → EXPO_PUBLIC_GROQ_API_KEY, y volver a
+//     desplegar. Expo la incrusta al CONSTRUIR la web: si la cambiás, hay que reconstruir.
+//   · Tiene que escribirse exactamente process.env.EXPO_PUBLIC_GROQ_API_KEY (con punto, sin
+//     desestructurar ni usar corchetes): si no, Expo no la reemplaza y queda undefined.
+//
+// OJO — LAS VARIABLES EXPO_PUBLIC_ NO SON SECRETAS: Expo las copia en texto plano dentro del
+// JavaScript que se descarga, así que cualquiera que abra la web puede leerla. Esto evita que
+// la clave quede en el código y en Git, pero NO la esconde. Para protegerla de verdad, la
+// llamada a Groq tiene que hacerla un servidor (una función de Vercel o una Edge Function de
+// Supabase) que guarde la clave sin mostrarla.
 // ─────────────────────────────────────────────────────────────────────────────
 const GROQ_API_KEY = process.env.EXPO_PUBLIC_GROQ_API_KEY;
 const GROQ_URL     = 'https://api.groq.com/openai/v1/chat/completions';
+
+// ¿Hay una clave configurada? Si falta, la app usa el intérprete básico en lugar de fallar.
+const hasGroqKey = () => typeof GROQ_API_KEY === 'string' && GROQ_API_KEY.trim().length > 0;
 
 // IMPORTANTE: Groq APAGÓ llama-3.1-8b-instant el 16/08/2026 para el plan
 // gratuito (hoy devuelve error). Su reemplazo oficial es openai/gpt-oss-20b, que
@@ -982,9 +999,10 @@ const aiErrorMessage = (err) => {
   if (!err) return 'No se pudo completar la consulta a la IA.';
   const msg = String(err.message || '');
   if (err.name === 'AbortError') return 'La IA tardó demasiado en responder. Probá de nuevo.';
+  if (err.code === 'no_key') return 'La IA todavía no está configurada (falta la variable EXPO_PUBLIC_GROQ_API_KEY en el despliegue).';
   const s = err.status;
   if (s === 429) return 'Se alcanzó el límite gratuito de la IA (unas 30 consultas por minuto y 1.000 por día). Esperá un momento y probá de nuevo.';
-  if (s === 401) return 'Groq no aceptó la clave de acceso. Revisá GROQ_API_KEY.';
+  if (s === 401) return 'Groq no aceptó la clave de acceso. Revisá EXPO_PUBLIC_GROQ_API_KEY y que siga vigente en la consola de Groq.';
   if (s === 403) return `Groq rechazó el acceso (${msg.slice(0, 120)}).`;
   if (err.modelGone) return 'Los modelos de Groq configurados ya no están disponibles. Hay que actualizar la lista GROQ_MODELS.';
   if (s === 400) return `Groq rechazó la solicitud (${msg.slice(0, 120)}).`;
@@ -999,6 +1017,11 @@ const aiErrorMessage = (err) => {
 // Llama a chat/completions pidiendo JSON. Devuelve { text, error }.
 // Solo un modelo retirado (404 o "decommissioned") pasa al siguiente de la lista.
 const groqChat = async (systemPrompt, userText) => {
+  if (!hasGroqKey()) {                 // sin clave no se consulta nada (así nunca se manda "Bearer undefined")
+    const err = new Error('Falta la clave de Groq');
+    err.code = 'no_key';
+    return { text: null, error: err };
+  }
   let lastError = null;
   for (const model of GROQ_MODELS) {
     const controller = new AbortController();
@@ -1021,7 +1044,7 @@ const groqChat = async (systemPrompt, userText) => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${GROQ_API_KEY}`,
+          'Authorization': `Bearer ${GROQ_API_KEY.trim()}`,
         },
         body: JSON.stringify(body),
         signal: controller.signal,
@@ -2303,6 +2326,160 @@ const openPrintView = (r) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// APP WEB INSTALADA (PWA) EN EL CELULAR
+//
+// Hace que la web se comporte como una app instalada:
+//  · La PÁGINA no se desplaza ni "rebota": solo se desplazan las listas y los
+//    formularios; los encabezados y la barra de navegación quedan fijos.
+//  · Sin zoom: ni pellizcar, ni doble toque, ni el zoom automático que hace el iPhone
+//    al tocar un campo de texto. (Para ver más grande está "Texto grande" en Ajustes.)
+//  · El alto es el alto REAL visible. En el celular "100vh" miente (cuenta la barra del
+//    navegador y el teclado), por eso se usa 100dvh y se sigue a window.visualViewport.
+//  · Con el teclado abierto, las hojas de formulario suben por encima del teclado y su
+//    contenido se desplaza hasta el final (ver FormSheetModal).
+// Nota: lo ideal es poner también estas etiquetas en el HTML de la web (+html / index.html);
+// acá se aplican al abrir la app, así funciona aunque no se toque ese archivo.
+// ─────────────────────────────────────────────────────────────────────────────
+const WEB_SHELL_STYLE_ID   = 'fincontrol-web-shell';
+const WEB_VIEWPORT_CONTENT = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content';
+const WEB_SHELL_CSS = [
+  'html, body, #root { margin: 0; padding: 0; width: 100%; height: 100vh; height: 100dvh; overflow: hidden; overscroll-behavior: none; }',
+  'body { position: fixed; top: 0; left: 0; right: 0; }',              // iOS Safari: evita el rebote de toda la página
+  '#root { display: flex; flex-direction: column; }',
+  'html { touch-action: manipulation; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }',
+  '* { overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }',
+].join('\n');
+
+// Aplica todo lo anterior. Devuelve la función que quita los "escuchadores".
+const installWebAppShell = (win, doc) => {
+  win = win || (typeof window !== 'undefined' ? window : null);
+  doc = doc || (typeof document !== 'undefined' ? document : null);
+  if (!win || !doc || !doc.head) return () => {};
+  const cleanups = [];
+
+  // 1) Estilos globales (una sola vez)
+  if (!doc.getElementById(WEB_SHELL_STYLE_ID)) {
+    const style = doc.createElement('style');
+    style.id = WEB_SHELL_STYLE_ID;
+    style.textContent = WEB_SHELL_CSS;
+    doc.head.appendChild(style);
+  }
+
+  // 2) Viewport: sin zoom, y en Chrome/Firefox de Android el teclado achica el contenido
+  let meta = doc.querySelector('meta[name="viewport"]');
+  if (!meta) {
+    meta = doc.createElement('meta');
+    meta.setAttribute('name', 'viewport');
+    doc.head.appendChild(meta);
+  }
+  meta.setAttribute('content', WEB_VIEWPORT_CONTENT);
+
+  // 3) Datos de "app instalada" (cada uno una sola vez)
+  [
+    ['mobile-web-app-capable', 'yes'],
+    ['apple-mobile-web-app-capable', 'yes'],
+    ['apple-mobile-web-app-status-bar-style', 'default'],
+    ['apple-mobile-web-app-title', 'FinControl'],
+    ['theme-color', LIGHT.bg],
+  ].forEach(([name, content]) => {
+    if (doc.querySelector(`meta[name="${name}"]`)) return;
+    const m = doc.createElement('meta');
+    m.setAttribute('name', name);
+    m.setAttribute('content', content);
+    doc.head.appendChild(m);
+  });
+
+  // 4) iPhone: bloquea el zoom por pellizco
+  const stopGesture = (e) => { if (e && e.preventDefault) e.preventDefault(); };
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach(type => {
+    doc.addEventListener(type, stopGesture, { passive: false });
+    cleanups.push(() => doc.removeEventListener(type, stopGesture));
+  });
+
+  // 5) El contenedor de la app mide lo que realmente se ve (se achica con el teclado)
+  const vv = win.visualViewport;
+  const syncRoot = () => {
+    const root = doc.getElementById('root');
+    if (!root || !vv) return;
+    root.style.height = Math.round(vv.height) + 'px';
+    // iPhone: al abrirse el teclado la ventana visible puede correrse hacia abajo; se acompaña
+    root.style.transform = vv.offsetTop > 0 ? `translateY(${Math.round(vv.offsetTop)}px)` : '';
+  };
+  if (vv && vv.addEventListener) {
+    vv.addEventListener('resize', syncRoot);
+    vv.addEventListener('scroll', syncRoot);
+    cleanups.push(() => { vv.removeEventListener('resize', syncRoot); vv.removeEventListener('scroll', syncRoot); });
+    syncRoot();
+  }
+
+  // 6) Al tocar un campo, se lo trae al centro de su zona de desplazamiento (cuando ya subió el teclado)
+  const onFocusIn = (e) => {
+    const t = e && e.target;
+    if (!t || !/^(INPUT|TEXTAREA)$/i.test(t.tagName || '')) return;
+    win.setTimeout(() => { try { t.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (_) {} }, 350);
+  };
+  doc.addEventListener('focusin', onFocusIn);
+  cleanups.push(() => doc.removeEventListener('focusin', onFocusIn));
+
+  return () => cleanups.forEach(f => { try { f(); } catch (_) {} });
+};
+
+// Cuánto tapa el teclado y cuánto alto realmente se ve.
+//  · iPhone y Android (por defecto): el teclado achica solo la ventana VISIBLE, no la de la página;
+//    los elementos fijos (como las hojas de formulario) quedan tapados → hay que subirlos.
+//  · Si el navegador achica también la página (interactive-widget=resizes-content), el inset da 0.
+const computeKeyboardInset = (win) => {
+  win = win || (typeof window !== 'undefined' ? window : null);
+  const vv   = win && win.visualViewport;
+  const full = (win && win.innerHeight) || 0;
+  if (!vv) return { inset: 0, height: full };
+  const raw = Math.round(full - vv.height - (vv.offsetTop || 0));
+  return { inset: raw > 80 ? raw : 0, height: Math.round(vv.height) };   // menos de 80 px = barra del navegador, no teclado
+};
+
+// Avisa cada vez que cambia el teclado / la ventana visible. Devuelve la función para dejar de escuchar.
+const watchViewport = (win, onChange) => {
+  win = win || (typeof window !== 'undefined' ? window : null);
+  if (!win) return () => {};
+  const vv = win.visualViewport;
+  const emit = () => onChange(computeKeyboardInset(win));
+  const targets = [];
+  if (vv && vv.addEventListener) { vv.addEventListener('resize', emit); vv.addEventListener('scroll', emit); targets.push(vv); }
+  if (win.addEventListener) win.addEventListener('resize', emit);
+  emit();
+  return () => {
+    targets.forEach(t => { t.removeEventListener('resize', emit); t.removeEventListener('scroll', emit); });
+    if (win.removeEventListener) win.removeEventListener('resize', emit);
+  };
+};
+
+// Tamaño y posición de una hoja de formulario (puro: se prueba solo)
+//  · maxHeight SIEMPRE es un número: así la hoja nunca crece más que la pantalla y su contenido se desplaza.
+//  · bottomInset: cuánto subirla para que quede por encima del teclado (solo en la web).
+const sheetBoxFor = (platform, winHeight, kb) => {
+  if (platform === 'web') {
+    const h    = (kb && kb.height) || winHeight || 0;
+    const open = !!(kb && kb.inset > 0);
+    return { maxHeight: h > 0 ? (open ? Math.max(240, h - 12) : Math.round(h * 0.92)) : undefined, bottomInset: open ? kb.inset : 0 };
+  }
+  return { maxHeight: winHeight > 0 ? Math.round(winHeight * 0.92) : undefined, bottomInset: 0 };
+};
+
+const useWebKeyboardBox = () => {
+  const [box, setBox] = useState({ inset: 0, height: 0 });
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof window === 'undefined') return undefined;
+    return watchViewport(window, setBox);
+  }, []);
+  return box;
+};
+const useSheetBox = () => {
+  const win = useWindowDimensions();
+  const kb  = useWebKeyboardBox();
+  return sheetBoxFor(Platform.OS, win.height, kb);
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // STYLE FACTORY
 // ─────────────────────────────────────────────────────────────────────────────
 const mkSt = C => StyleSheet.create({
@@ -2313,7 +2490,8 @@ const mkSt = C => StyleSheet.create({
   fieldLabel: { fontSize: F.xs, fontWeight: '600', color: C.inkMuted, letterSpacing: 0.5, marginBottom: S.xs, textTransform: 'uppercase' },
   inputWrap:  { flexDirection: 'row', alignItems: 'center', borderWidth: 1.5, borderColor: C.border, borderRadius: R.md, backgroundColor: C.surface },
   inputIcon:  { paddingLeft: 14 },
-  inputField: { flex: 1, fontSize: F.md, color: C.ink, paddingHorizontal: 12, paddingVertical: 13 },
+  // En la web, los campos de texto miden 16 px o más: si no, el iPhone agranda la página al tocarlos
+  inputField: { flex: 1, fontSize: Platform.OS === 'web' ? Math.max(16, F.md) : F.md, color: C.ink, paddingHorizontal: 12, paddingVertical: 13 },
   sectionLabel: { fontSize: F.sm, fontWeight: '700', color: C.inkMuted, letterSpacing: 0.2, marginBottom: S.sm },
 
   // Login
@@ -2399,8 +2577,12 @@ const mkSt = C => StyleSheet.create({
   // modalSheet es ahora solo el contenedor visual; KAV y SV están adentro
   modalSheet:   { backgroundColor: C.surface, borderTopLeftRadius: 28, borderTopRightRadius: 28, borderTopWidth: 1, borderColor: C.border, maxHeight: '92%' },
   modalHandle:  { width: 40, height: 4, borderRadius: 2, backgroundColor: C.border, alignSelf: 'center', marginTop: 12, marginBottom: S.sm },
-  modalInner:   { padding: S.lg, paddingBottom: Platform.OS === 'ios' ? 40 : 24 },
+  modalInner:   { padding: S.lg, paddingBottom: 40 },
   modalTitle:   { fontSize: F.lg, fontWeight: '700', color: C.ink, marginBottom: S.md },
+  // Hojas de formulario (gasto, gasto fijo, cuota): fondo, hoja con alto máximo real y pie fijo con el botón
+  sheetRoot:     { flex: 1, justifyContent: 'flex-end' },
+  sheetBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(15,23,42,0.52)' },
+  sheetFooter:   { paddingHorizontal: S.lg, paddingTop: S.sm, paddingBottom: S.md + 4, borderTopWidth: 1, borderTopColor: C.border, backgroundColor: C.surface },
 
   // Segmented control
   segmented: { flexDirection: 'row', backgroundColor: C.surfaceAlt, borderRadius: R.md, padding: 3, marginBottom: S.md },
@@ -2438,7 +2620,7 @@ const mkSt = C => StyleSheet.create({
   micBtnOn:       { backgroundColor: C.negative },
   micLabel:       { fontSize: F.sm, fontWeight: '700', color: C.ink, textAlign: 'center', marginBottom: S.sm },
   voiceInputWrap: { flexDirection: 'row', alignItems: 'center', borderWidth: 1.5, borderColor: C.border, borderRadius: R.md, backgroundColor: C.surface },
-  voiceInput:     { flex: 1, fontSize: F.sm, color: C.ink, paddingHorizontal: 12, paddingVertical: 11 },
+  voiceInput:     { flex: 1, fontSize: Platform.OS === 'web' ? Math.max(16, F.sm) : F.sm, color: C.ink, paddingHorizontal: 12, paddingVertical: 11 },
   voiceApplyBtn:  { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, backgroundColor: C.surface, borderRadius: R.sm, borderWidth: 1.5, borderColor: C.accent, paddingVertical: 10, marginTop: S.sm },
   voiceApplyTxt:  { fontSize: F.sm, fontWeight: '700', color: C.accent },
   voiceFeedback:  { flexDirection: 'row', alignItems: 'flex-start', gap: 6, borderRadius: R.sm, padding: S.sm, marginTop: S.sm, borderWidth: 1 },
@@ -2909,6 +3091,51 @@ const CATS_META = [
   { label: 'Suscripciones', icon: 'play-circle' }, { label: 'Otro', icon: 'more-horizontal' },
 ];
 
+// ─────────────────────────────────────────────────────────────────────────────
+// HOJA DE FORMULARIO (gasto, gasto fijo, cuota)
+//
+// Por qué antes el botón "Guardar" quedaba tapado: la hoja no tenía un alto máximo real (estaba
+// dentro de un contenedor sin alto definido, así que el 92 % no se aplicaba), crecía más que la
+// pantalla y el ScrollView de adentro nunca llegaba a desplazarse. Ahora:
+//  · la hoja tiene un alto máximo NUMÉRICO (92 % de lo que se ve; con el teclado, todo el alto
+//    visible), así su contenido se desplaza hasta el final;
+//  · el botón va en un pie FIJO: nunca queda tapado ni hay que buscarlo;
+//  · en el teléfono se usa KeyboardAvoidingView (iOS "padding", Android "height"); en la web,
+//    donde ese componente no hace nada, la hoja sube por encima del teclado con visualViewport;
+//  · keyboardShouldPersistTaps="handled": tocar un botón con el teclado abierto funciona al primer toque.
+// ─────────────────────────────────────────────────────────────────────────────
+function FormSheetModal({ visible, onClose, C, header, footer, children }) {
+  const st  = mkSt(C);
+  const box = useSheetBox();
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        enabled={Platform.OS !== 'web'}
+        style={st.sheetRoot}
+      >
+        {/* Fondo oscuro: tocar afuera cierra */}
+        <TouchableWithoutFeedback onPress={onClose}>
+          <View style={st.sheetBackdrop} />
+        </TouchableWithoutFeedback>
+
+        <View style={[st.modalSheet, { maxHeight: box.maxHeight, marginBottom: box.bottomInset }]}>
+          <View style={st.modalHandle} />
+          {header}
+          <ScrollView
+            contentContainerStyle={[st.modalInner, header ? { paddingTop: S.sm } : null]}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+          >
+            {children}
+          </ScrollView>
+          {footer ? <View style={st.sheetFooter}>{footer}</View> : null}
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
+
 function AddEditModal({ visible, onClose, onSave, editTx, C }) {
   const isEdit = !!editTx;
   const st = mkSt(C);
@@ -3132,216 +3359,198 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
   const closeModal = () => { resetForm(); onClose(); };
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={closeModal}>
-      {/* Overlay tappable para cerrar */}
-      <TouchableWithoutFeedback onPress={closeModal}>
-        <View style={st.modalOverlay} />
-      </TouchableWithoutFeedback>
-
-      {/* FIX #3: KAV con behavior correcto por plataforma */}
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        style={{ justifyContent: 'flex-end' }}
-      >
-        <View style={st.modalSheet}>
-          <View style={st.modalHandle} />
-
-          {/* Barra fija arriba: título + cruz para cerrar sin guardar nada */}
-          <View style={st.modalTopRow}>
-            <Text style={st.modalTopTitle}>{isEdit ? 'Editar gasto' : 'Registrar gasto'}</Text>
-            <TouchableOpacity
-              style={st.modalCloseBtn}
-              onPress={closeModal}
-              activeOpacity={0.7}
-              accessibilityRole="button"
-              accessibilityLabel="Cerrar sin guardar"
-              hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
-            >
-              <Feather name="x" size={22} color={C.inkMuted} />
-            </TouchableOpacity>
-          </View>
-
-          {/* FIX #3: ScrollView con keyboardShouldPersistTaps */}
-          <ScrollView
-            contentContainerStyle={[st.modalInner, { paddingTop: S.sm }]}
-            keyboardShouldPersistTaps="handled"
-            showsVerticalScrollIndicator={false}
+    <FormSheetModal
+      visible={visible}
+      onClose={closeModal}
+      C={C}
+      header={(
+        <View style={st.modalTopRow}>
+          <Text style={st.modalTopTitle}>{isEdit ? 'Editar gasto' : 'Registrar gasto'}</Text>
+          <TouchableOpacity
+            style={st.modalCloseBtn}
+            onPress={closeModal}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="Cerrar sin guardar"
+            hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
           >
-            {/* Author selector */}
-            <Text style={st.fieldLabel}>
-              ¿Quién gastó? <Text style={{ textTransform: 'none', fontWeight: '500' }}>(opcional)</Text>
+            <Feather name="x" size={22} color={C.inkMuted} />
+          </TouchableOpacity>
+        </View>
+      )}
+      footer={(
+        <TouchableOpacity style={[st.modalBtn, { marginTop: 0 }]} onPress={handleSave}>
+          <Feather name={isEdit ? 'save' : 'check'} size={18} color="#fff" />
+          <Text style={st.modalBtnTxt}>{isEdit ? 'Guardar cambios' : 'Guardar gasto'}</Text>
+        </TouchableOpacity>
+      )}
+    >
+      {/* Author selector */}
+      <Text style={st.fieldLabel}>
+        ¿Quién gastó? <Text style={{ textTransform: 'none', fontWeight: '500' }}>(opcional)</Text>
+      </Text>
+      <Text style={st.optHint}>Podés dejarlo sin elegir. Tocá un nombre para elegirlo y tocalo de nuevo para quitarlo.</Text>
+      <AuthorSegmented value={author} onChange={setAuthor} optional C={C} />
+
+      {/* Dictado por voz: solo al cargar un gasto nuevo */}
+      {!isEdit && (
+        <>
+          {/* ── DICTADO POR VOZ — todo en columna: título, micrófono, frase, resultado ── */}
+          <View style={st.voiceCard}>
+            <View style={st.voiceHeader}>
+              <View style={st.voiceIconWrap}>
+                <Feather name="mic" size={16} color={C.accent} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={st.voiceTitle}>Dictar el gasto</Text>
+                <Text style={st.voiceSub}>Decí, por ejemplo: “Cinco mil pesos en verdulería”</Text>
+              </View>
+            </View>
+
+            {/* Micrófono grande, centrado, con anillo que late mientras escucha */}
+            <View style={st.micStage}>
+              {listening && (
+                <Animated.View
+                  pointerEvents="none"
+                  style={[st.micRing, { transform: [{ scale: ringScale }], opacity: ringOpacity }]}
+                />
+              )}
+              <TouchableOpacity
+                style={[
+                  st.micBtn,
+                  listening && st.micBtnOn,
+                  (!speechSupported || micPerm === 'denied') && { opacity: 0.5 },
+                ]}
+                onPress={startListening}
+                disabled={interpreting}
+                activeOpacity={0.8}
+                accessibilityRole="button"
+                accessibilityLabel={listening || starting ? 'Terminar de dictar' : 'Dictar gasto con la voz'}
+              >
+                {interpreting || starting
+                  ? <ActivityIndicator size="small" color="#fff" />
+                  : <Feather name={listening ? 'square' : 'mic'} size={30} color="#fff" />}
+              </TouchableOpacity>
+            </View>
+            <Text style={st.micLabel}>
+              {listening ? 'Escuchando… hablá ahora (tocá para terminar)'
+                : starting ? 'Preparando el micrófono… si aparece un cartel, tocá “Permitir”'
+                : interpreting ? 'Interpretando con IA…'
+                : !speechSupported ? 'El micrófono funciona en el navegador. Acá podés escribir la frase:'
+                : micPerm === 'denied' ? 'El micrófono está bloqueado en este sitio. Tocá el botón para ver cómo activarlo.'
+                : 'Tocá el micrófono y hablá'}
             </Text>
-            <Text style={st.optHint}>Podés dejarlo sin elegir. Tocá un nombre para elegirlo y tocalo de nuevo para quitarlo.</Text>
-            <AuthorSegmented value={author} onChange={setAuthor} optional C={C} />
 
-            {/* Dictado por voz: solo al cargar un gasto nuevo */}
-            {!isEdit && (
-              <>
-                {/* ── DICTADO POR VOZ — todo en columna: título, micrófono, frase, resultado ── */}
-                <View style={st.voiceCard}>
-                  <View style={st.voiceHeader}>
-                    <View style={st.voiceIconWrap}>
-                      <Feather name="mic" size={16} color={C.accent} />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={st.voiceTitle}>Dictar el gasto</Text>
-                      <Text style={st.voiceSub}>Decí, por ejemplo: “Cinco mil pesos en verdulería”</Text>
-                    </View>
-                  </View>
+            {/* Frase reconocida (editable). También sirve para dictar con el micrófono del teclado */}
+            <View style={st.voiceInputWrap}>
+              <TextInput
+                style={st.voiceInput}
+                placeholder="O escribí la frase acá (podés usar el micrófono del teclado)"
+                placeholderTextColor={C.inkFaint}
+                value={voiceText}
+                onChangeText={setVoiceText}
+                onSubmitEditing={() => voiceText.trim() && applyVoiceText(voiceText)}
+                returnKeyType="done"
+                editable={!listening && !starting && !interpreting}
+              />
+            </View>
 
-                  {/* Micrófono grande, centrado, con anillo que late mientras escucha */}
-                  <View style={st.micStage}>
-                    {listening && (
-                      <Animated.View
-                        pointerEvents="none"
-                        style={[st.micRing, { transform: [{ scale: ringScale }], opacity: ringOpacity }]}
-                      />
-                    )}
-                    <TouchableOpacity
-                      style={[
-                        st.micBtn,
-                        listening && st.micBtnOn,
-                        (!speechSupported || micPerm === 'denied') && { opacity: 0.5 },
-                      ]}
-                      onPress={startListening}
-                      disabled={interpreting}
-                      activeOpacity={0.8}
-                      accessibilityRole="button"
-                      accessibilityLabel={listening || starting ? 'Terminar de dictar' : 'Dictar gasto con la voz'}
-                    >
-                      {interpreting || starting
-                        ? <ActivityIndicator size="small" color="#fff" />
-                        : <Feather name={listening ? 'square' : 'mic'} size={30} color="#fff" />}
-                    </TouchableOpacity>
-                  </View>
-                  <Text style={st.micLabel}>
-                    {listening ? 'Escuchando… hablá ahora (tocá para terminar)'
-                      : starting ? 'Preparando el micrófono… si aparece un cartel, tocá “Permitir”'
-                      : interpreting ? 'Interpretando con IA…'
-                      : !speechSupported ? 'El micrófono funciona en el navegador. Acá podés escribir la frase:'
-                      : micPerm === 'denied' ? 'El micrófono está bloqueado en este sitio. Tocá el botón para ver cómo activarlo.'
-                      : 'Tocá el micrófono y hablá'}
-                  </Text>
-
-                  {/* Frase reconocida (editable). También sirve para dictar con el micrófono del teclado */}
-                  <View style={st.voiceInputWrap}>
-                    <TextInput
-                      style={st.voiceInput}
-                      placeholder="O escribí la frase acá (podés usar el micrófono del teclado)"
-                      placeholderTextColor={C.inkFaint}
-                      value={voiceText}
-                      onChangeText={setVoiceText}
-                      onSubmitEditing={() => voiceText.trim() && applyVoiceText(voiceText)}
-                      returnKeyType="done"
-                      editable={!listening && !starting && !interpreting}
-                    />
-                  </View>
-
-                  {voiceText.trim().length > 0 && !listening && !starting && (
-                    <TouchableOpacity
-                      style={[st.voiceApplyBtn, interpreting && { opacity: 0.6 }]}
-                      onPress={() => applyVoiceText(voiceText)}
-                      disabled={interpreting}
-                      activeOpacity={0.8}
-                    >
-                      {interpreting
-                        ? <ActivityIndicator size="small" color={C.accent} />
-                        : <Feather name="zap" size={15} color={C.accent} />}
-                      <Text style={st.voiceApplyTxt}>
-                        {interpreting ? 'Interpretando con IA…' : 'Completar campos con esta frase'}
-                      </Text>
-                    </TouchableOpacity>
-                  )}
-
-                  {voiceFeedback && (
-                    <View style={[
-                      st.voiceFeedback,
-                      voiceFeedback.ok
-                        ? { backgroundColor: C.positiveBg, borderColor: C.positiveBorder }
-                        : { backgroundColor: C.warnBg,     borderColor: C.warn + '66' },
-                    ]}>
-                      <Feather
-                        name={voiceFeedback.ok ? 'check-circle' : 'alert-circle'}
-                        size={14}
-                        color={voiceFeedback.ok ? C.positive : C.warn}
-                        style={{ marginTop: 1 }}
-                      />
-                      <View style={{ flex: 1 }}>
-                        <Text style={[st.voiceFeedbackTxt, { color: voiceFeedback.ok ? C.positive : C.warn, flex: 0 }]}>
-                          {voiceFeedback.text}
-                        </Text>
-                        {voiceFeedback.detail ? (
-                          <Text style={[st.voiceFeedbackTxt, { color: C.inkMuted, fontSize: F.xs, marginTop: 4, flex: 0 }]}>
-                            {voiceFeedback.detail}
-                          </Text>
-                        ) : null}
-                      </View>
-                    </View>
-                  )}
-                </View>
-
-              </>
+            {voiceText.trim().length > 0 && !listening && !starting && (
+              <TouchableOpacity
+                style={[st.voiceApplyBtn, interpreting && { opacity: 0.6 }]}
+                onPress={() => applyVoiceText(voiceText)}
+                disabled={interpreting}
+                activeOpacity={0.8}
+              >
+                {interpreting
+                  ? <ActivityIndicator size="small" color={C.accent} />
+                  : <Feather name="zap" size={15} color={C.accent} />}
+                <Text style={st.voiceApplyTxt}>
+                  {interpreting ? 'Interpretando con IA…' : 'Completar campos con esta frase'}
+                </Text>
+              </TouchableOpacity>
             )}
 
-            {/* Monto */}
-            <Text style={st.fieldLabel}>Monto</Text>
-            <View style={[st.inputWrap, { marginBottom: S.md }]}>
-              <Feather name="dollar-sign" size={16} color={C.inkMuted} style={st.inputIcon} />
-              <TextInput
-                style={[st.inputField, { fontSize: F.xl, fontWeight: '800' }]}
-                placeholder="0"
-                placeholderTextColor={C.inkFaint}
-                keyboardType="decimal-pad"
-                value={amt}
-                onChangeText={t => setAmt(maskAmountInput(t))}
-                returnKeyType="next"
-              />
-            </View>
-
-            {/* Descripción */}
-            <Text style={st.fieldLabel}>Descripción</Text>
-            <View style={[st.inputWrap, { marginBottom: S.md }]}>
-              <Feather name="edit-3" size={16} color={C.inkMuted} style={st.inputIcon} />
-              <TextInput
-                style={st.inputField}
-                placeholder="ej. Supermercado COTO"
-                placeholderTextColor={C.inkFaint}
-                value={desc}
-                onChangeText={setDesc}
-                returnKeyType="done"
-              />
-            </View>
-
-            {/* Categoría */}
-            <Text style={st.fieldLabel}>Categoría</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: S.sm }} keyboardShouldPersistTaps="handled">
-              {CATS_META.map(({ label, icon }) => (
-                <TouchableOpacity key={label} onPress={() => setCat(label)}
-                  style={[st.catChip, cat === label && st.catChipOn]}>
-                  <Feather name={icon} size={13} color={cat === label ? '#fff' : C.inkMuted} style={{ marginRight: 4 }} />
-                  <Text style={[st.catChipTxt, cat === label && { color: '#fff' }]}>{label}</Text>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-
-            {/* Recurrente */}
-            <TouchableOpacity style={st.recurRow} onPress={() => setRecur(r => !r)}>
-              <View style={[st.recurCheck, recur && st.recurCheckOn]}>
-                {recur && <Feather name="check" size={12} color="#fff" />}
+            {voiceFeedback && (
+              <View style={[
+                st.voiceFeedback,
+                voiceFeedback.ok
+                  ? { backgroundColor: C.positiveBg, borderColor: C.positiveBorder }
+                  : { backgroundColor: C.warnBg,     borderColor: C.warn + '66' },
+              ]}>
+                <Feather
+                  name={voiceFeedback.ok ? 'check-circle' : 'alert-circle'}
+                  size={14}
+                  color={voiceFeedback.ok ? C.positive : C.warn}
+                  style={{ marginTop: 1 }}
+                />
+                <View style={{ flex: 1 }}>
+                  <Text style={[st.voiceFeedbackTxt, { color: voiceFeedback.ok ? C.positive : C.warn, flex: 0 }]}>
+                    {voiceFeedback.text}
+                  </Text>
+                  {voiceFeedback.detail ? (
+                    <Text style={[st.voiceFeedbackTxt, { color: C.inkMuted, fontSize: F.xs, marginTop: 4, flex: 0 }]}>
+                      {voiceFeedback.detail}
+                    </Text>
+                  ) : null}
+                </View>
               </View>
-              <Feather name="repeat" size={14} color={C.inkMuted} style={{ marginRight: 6 }} />
-              <Text style={st.recurLabel}>Gasto fijo / recurrente</Text>
-            </TouchableOpacity>
+            )}
+          </View>
 
-            {/* Guardar */}
-            <TouchableOpacity style={st.modalBtn} onPress={handleSave}>
-              <Feather name={isEdit ? 'save' : 'check'} size={18} color="#fff" />
-              <Text style={st.modalBtnTxt}>{isEdit ? 'Guardar cambios' : 'Guardar gasto'}</Text>
-            </TouchableOpacity>
-          </ScrollView>
+        </>
+      )}
+
+      {/* Monto */}
+      <Text style={st.fieldLabel}>Monto</Text>
+      <View style={[st.inputWrap, { marginBottom: S.md }]}>
+        <Feather name="dollar-sign" size={16} color={C.inkMuted} style={st.inputIcon} />
+        <TextInput
+          style={[st.inputField, { fontSize: F.xl, fontWeight: '800' }]}
+          placeholder="0"
+          placeholderTextColor={C.inkFaint}
+          keyboardType="decimal-pad"
+          value={amt}
+          onChangeText={t => setAmt(maskAmountInput(t))}
+          returnKeyType="next"
+        />
+      </View>
+
+      {/* Descripción */}
+      <Text style={st.fieldLabel}>Descripción</Text>
+      <View style={[st.inputWrap, { marginBottom: S.md }]}>
+        <Feather name="edit-3" size={16} color={C.inkMuted} style={st.inputIcon} />
+        <TextInput
+          style={st.inputField}
+          placeholder="ej. Supermercado COTO"
+          placeholderTextColor={C.inkFaint}
+          value={desc}
+          onChangeText={setDesc}
+          returnKeyType="done"
+        />
+      </View>
+
+      {/* Categoría */}
+      <Text style={st.fieldLabel}>Categoría</Text>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: S.sm }} keyboardShouldPersistTaps="handled">
+        {CATS_META.map(({ label, icon }) => (
+          <TouchableOpacity key={label} onPress={() => setCat(label)}
+            style={[st.catChip, cat === label && st.catChipOn]}>
+            <Feather name={icon} size={13} color={cat === label ? '#fff' : C.inkMuted} style={{ marginRight: 4 }} />
+            <Text style={[st.catChipTxt, cat === label && { color: '#fff' }]}>{label}</Text>
+          </TouchableOpacity>
+        ))}
+      </ScrollView>
+
+      {/* Recurrente */}
+      <TouchableOpacity style={st.recurRow} onPress={() => setRecur(r => !r)}>
+        <View style={[st.recurCheck, recur && st.recurCheckOn]}>
+          {recur && <Feather name="check" size={12} color="#fff" />}
         </View>
-      </KeyboardAvoidingView>
-    </Modal>
+        <Feather name="repeat" size={14} color={C.inkMuted} style={{ marginRight: 6 }} />
+        <Text style={st.recurLabel}>Gasto fijo / recurrente</Text>
+      </TouchableOpacity>
+    </FormSheetModal>
   );
 }
 
@@ -4124,65 +4333,60 @@ function FixedExpenseFormModal({ visible, onClose, onSave, editItem, C }) {
   };
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <TouchableWithoutFeedback onPress={onClose}>
-        <View style={st.modalOverlay} />
-      </TouchableWithoutFeedback>
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ justifyContent: 'flex-end' }}>
-        <View style={st.modalSheet}>
-          <View style={st.modalHandle} />
-          <ScrollView contentContainerStyle={st.modalInner} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
-            <Text style={st.modalTitle}>{editItem ? 'Editar gasto fijo' : 'Nuevo gasto fijo'}</Text>
+    <FormSheetModal
+      visible={visible}
+      onClose={onClose}
+      C={C}
+      footer={(
+        <TouchableOpacity style={[st.modalBtn, { marginTop: 0 }]} onPress={handleSave}>
+          <Feather name="check" size={18} color="#fff" />
+          <Text style={st.modalBtnTxt}>{editItem ? 'Guardar cambios' : 'Agregar gasto fijo'}</Text>
+        </TouchableOpacity>
+      )}
+    >
+      <Text style={st.modalTitle}>{editItem ? 'Editar gasto fijo' : 'Nuevo gasto fijo'}</Text>
 
-            <Text style={st.fieldLabel}>¿Quién lo paga?</Text>
-            <AuthorSegmented value={author} onChange={setAuthor} C={C} />
+      <Text style={st.fieldLabel}>¿Quién lo paga?</Text>
+      <AuthorSegmented value={author} onChange={setAuthor} C={C} />
 
-            <Text style={st.fieldLabel}>Descripción</Text>
-            <View style={[st.inputWrap, { marginBottom: S.md }]}>
-              <Feather name="tag" size={16} color={C.inkMuted} style={st.inputIcon} />
-              <TextInput
-                style={st.inputField}
-                placeholder="ej. Luz, Alquiler, Expensas…"
-                placeholderTextColor={C.inkFaint}
-                value={desc}
-                onChangeText={setDesc}
-                returnKeyType="next"
-              />
-            </View>
+      <Text style={st.fieldLabel}>Descripción</Text>
+      <View style={[st.inputWrap, { marginBottom: S.md }]}>
+        <Feather name="tag" size={16} color={C.inkMuted} style={st.inputIcon} />
+        <TextInput
+          style={st.inputField}
+          placeholder="ej. Luz, Alquiler, Expensas…"
+          placeholderTextColor={C.inkFaint}
+          value={desc}
+          onChangeText={setDesc}
+          returnKeyType="next"
+        />
+      </View>
 
-            <Text style={st.fieldLabel}>Monto mensual estimado</Text>
-            <View style={[st.inputWrap, { marginBottom: S.md }]}>
-              <Feather name="dollar-sign" size={16} color={C.inkMuted} style={st.inputIcon} />
-              <TextInput
-                style={[st.inputField, { fontSize: F.xl, fontWeight: '800' }]}
-                placeholder="0"
-                placeholderTextColor={C.inkFaint}
-                keyboardType="decimal-pad"
-                value={amt}
-                onChangeText={t => setAmt(maskAmountInput(t))}
-                returnKeyType="done"
-              />
-            </View>
+      <Text style={st.fieldLabel}>Monto mensual estimado</Text>
+      <View style={[st.inputWrap, { marginBottom: S.md }]}>
+        <Feather name="dollar-sign" size={16} color={C.inkMuted} style={st.inputIcon} />
+        <TextInput
+          style={[st.inputField, { fontSize: F.xl, fontWeight: '800' }]}
+          placeholder="0"
+          placeholderTextColor={C.inkFaint}
+          keyboardType="decimal-pad"
+          value={amt}
+          onChangeText={t => setAmt(maskAmountInput(t))}
+          returnKeyType="done"
+        />
+      </View>
 
-            <Text style={st.fieldLabel}>Categoría</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: S.md }} keyboardShouldPersistTaps="handled">
-              {CATS_META.map(({ label, icon }) => (
-                <TouchableOpacity key={label} onPress={() => setCat(label)}
-                  style={[st.catChip, cat === label && st.catChipOn]}>
-                  <Feather name={icon} size={13} color={cat === label ? '#fff' : C.inkMuted} style={{ marginRight: 4 }} />
-                  <Text style={[st.catChipTxt, cat === label && { color: '#fff' }]}>{label}</Text>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-
-            <TouchableOpacity style={st.modalBtn} onPress={handleSave}>
-              <Feather name="check" size={18} color="#fff" />
-              <Text style={st.modalBtnTxt}>{editItem ? 'Guardar cambios' : 'Agregar gasto fijo'}</Text>
-            </TouchableOpacity>
-          </ScrollView>
-        </View>
-      </KeyboardAvoidingView>
-    </Modal>
+      <Text style={st.fieldLabel}>Categoría</Text>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: S.md }} keyboardShouldPersistTaps="handled">
+        {CATS_META.map(({ label, icon }) => (
+          <TouchableOpacity key={label} onPress={() => setCat(label)}
+            style={[st.catChip, cat === label && st.catChipOn]}>
+            <Feather name={icon} size={13} color={cat === label ? '#fff' : C.inkMuted} style={{ marginRight: 4 }} />
+            <Text style={[st.catChipTxt, cat === label && { color: '#fff' }]}>{label}</Text>
+          </TouchableOpacity>
+        ))}
+      </ScrollView>
+    </FormSheetModal>
   );
 }
 
@@ -4404,98 +4608,93 @@ function InstallmentFormModal({ visible, onClose, onSave, editItem, C }) {
   };
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <TouchableWithoutFeedback onPress={onClose}>
-        <View style={st.modalOverlay} />
-      </TouchableWithoutFeedback>
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ justifyContent: 'flex-end' }}>
-        <View style={st.modalSheet}>
-          <View style={st.modalHandle} />
-          <ScrollView contentContainerStyle={st.modalInner} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
-            <Text style={st.modalTitle}>{editItem ? 'Editar cuota' : 'Nueva compra en cuotas'}</Text>
+    <FormSheetModal
+      visible={visible}
+      onClose={onClose}
+      C={C}
+      footer={(
+        <TouchableOpacity style={[st.modalBtn, { marginTop: 0 }]} onPress={handleSave}>
+          <Feather name="check" size={18} color="#fff" />
+          <Text style={st.modalBtnTxt}>{editItem ? 'Guardar cambios' : 'Registrar cuota'}</Text>
+        </TouchableOpacity>
+      )}
+    >
+      <Text style={st.modalTitle}>{editItem ? 'Editar cuota' : 'Nueva compra en cuotas'}</Text>
 
-            <Text style={st.fieldLabel}>¿Quién compró?</Text>
-            <AuthorSegmented value={author} onChange={setAuthor} C={C} />
+      <Text style={st.fieldLabel}>¿Quién compró?</Text>
+      <AuthorSegmented value={author} onChange={setAuthor} C={C} />
 
-            <Text style={st.fieldLabel}>Descripción del producto</Text>
-            <View style={[st.inputWrap, { marginBottom: S.md }]}>
-              <Feather name="package" size={16} color={C.inkMuted} style={st.inputIcon} />
-              <TextInput
-                style={st.inputField}
-                placeholder="ej. Lavarropas, Televisor…"
-                placeholderTextColor={C.inkFaint}
-                value={desc}
-                onChangeText={setDesc}
-                returnKeyType="next"
-              />
-            </View>
+      <Text style={st.fieldLabel}>Descripción del producto</Text>
+      <View style={[st.inputWrap, { marginBottom: S.md }]}>
+        <Feather name="package" size={16} color={C.inkMuted} style={st.inputIcon} />
+        <TextInput
+          style={st.inputField}
+          placeholder="ej. Lavarropas, Televisor…"
+          placeholderTextColor={C.inkFaint}
+          value={desc}
+          onChangeText={setDesc}
+          returnKeyType="next"
+        />
+      </View>
 
-            <Text style={st.fieldLabel}>Monto por cuota</Text>
-            <View style={[st.inputWrap, { marginBottom: S.md }]}>
-              <Feather name="dollar-sign" size={16} color={C.inkMuted} style={st.inputIcon} />
-              <TextInput
-                style={[st.inputField, { fontSize: F.xl, fontWeight: '800' }]}
-                placeholder="0"
-                placeholderTextColor={C.inkFaint}
-                keyboardType="decimal-pad"
-                value={amt}
-                onChangeText={t => setAmt(maskAmountInput(t))}
-                returnKeyType="next"
-              />
-            </View>
+      <Text style={st.fieldLabel}>Monto por cuota</Text>
+      <View style={[st.inputWrap, { marginBottom: S.md }]}>
+        <Feather name="dollar-sign" size={16} color={C.inkMuted} style={st.inputIcon} />
+        <TextInput
+          style={[st.inputField, { fontSize: F.xl, fontWeight: '800' }]}
+          placeholder="0"
+          placeholderTextColor={C.inkFaint}
+          keyboardType="decimal-pad"
+          value={amt}
+          onChangeText={t => setAmt(maskAmountInput(t))}
+          returnKeyType="next"
+        />
+      </View>
 
-            <View style={{ flexDirection: 'row', gap: S.md, marginBottom: S.md }}>
-              <View style={{ flex: 1 }}>
-                <Text style={st.fieldLabel}>Cuota actual</Text>
-                <View style={st.inputWrap}>
-                  <Feather name="hash" size={16} color={C.inkMuted} style={st.inputIcon} />
-                  <TextInput
-                    style={st.inputField}
-                    placeholder="1"
-                    placeholderTextColor={C.inkFaint}
-                    keyboardType="number-pad"
-                    value={current}
-                    onChangeText={setCurrent}
-                    returnKeyType="next"
-                  />
-                </View>
-              </View>
-              <View style={{ flex: 1 }}>
-                <Text style={st.fieldLabel}>Total cuotas</Text>
-                <View style={st.inputWrap}>
-                  <Feather name="hash" size={16} color={C.inkMuted} style={st.inputIcon} />
-                  <TextInput
-                    style={st.inputField}
-                    placeholder="12"
-                    placeholderTextColor={C.inkFaint}
-                    keyboardType="number-pad"
-                    value={total}
-                    onChangeText={setTotal}
-                    returnKeyType="done"
-                  />
-                </View>
-              </View>
-            </View>
-
-            <Text style={st.fieldLabel}>Categoría</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: S.md }} keyboardShouldPersistTaps="handled">
-              {CATS_META.map(({ label, icon }) => (
-                <TouchableOpacity key={label} onPress={() => setCat(label)}
-                  style={[st.catChip, cat === label && st.catChipOn]}>
-                  <Feather name={icon} size={13} color={cat === label ? '#fff' : C.inkMuted} style={{ marginRight: 4 }} />
-                  <Text style={[st.catChipTxt, cat === label && { color: '#fff' }]}>{label}</Text>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-
-            <TouchableOpacity style={st.modalBtn} onPress={handleSave}>
-              <Feather name="check" size={18} color="#fff" />
-              <Text style={st.modalBtnTxt}>{editItem ? 'Guardar cambios' : 'Registrar cuota'}</Text>
-            </TouchableOpacity>
-          </ScrollView>
+      <View style={{ flexDirection: 'row', gap: S.md, marginBottom: S.md }}>
+        <View style={{ flex: 1 }}>
+          <Text style={st.fieldLabel}>Cuota actual</Text>
+          <View style={st.inputWrap}>
+            <Feather name="hash" size={16} color={C.inkMuted} style={st.inputIcon} />
+            <TextInput
+              style={st.inputField}
+              placeholder="1"
+              placeholderTextColor={C.inkFaint}
+              keyboardType="number-pad"
+              value={current}
+              onChangeText={setCurrent}
+              returnKeyType="next"
+            />
+          </View>
         </View>
-      </KeyboardAvoidingView>
-    </Modal>
+        <View style={{ flex: 1 }}>
+          <Text style={st.fieldLabel}>Total cuotas</Text>
+          <View style={st.inputWrap}>
+            <Feather name="hash" size={16} color={C.inkMuted} style={st.inputIcon} />
+            <TextInput
+              style={st.inputField}
+              placeholder="12"
+              placeholderTextColor={C.inkFaint}
+              keyboardType="number-pad"
+              value={total}
+              onChangeText={setTotal}
+              returnKeyType="done"
+            />
+          </View>
+        </View>
+      </View>
+
+      <Text style={st.fieldLabel}>Categoría</Text>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: S.md }} keyboardShouldPersistTaps="handled">
+        {CATS_META.map(({ label, icon }) => (
+          <TouchableOpacity key={label} onPress={() => setCat(label)}
+            style={[st.catChip, cat === label && st.catChipOn]}>
+            <Feather name={icon} size={13} color={cat === label ? '#fff' : C.inkMuted} style={{ marginRight: 4 }} />
+            <Text style={[st.catChipTxt, cat === label && { color: '#fff' }]}>{label}</Text>
+          </TouchableOpacity>
+        ))}
+      </ScrollView>
+    </FormSheetModal>
   );
 }
 
@@ -5401,6 +5600,11 @@ function ConfigScreen({ prefs, setPrefs, onLogout, onClearAll, transactions, aud
 // ─────────────────────────────────────────────────────────────────────────────
 // APP SHELL
 // ─────────────────────────────────────────────────────────────────────────────
+// En la web los contenedores principales no se desplazan (solo lo hacen las listas y los formularios).
+// El alto lo da #root (100dvh / alto visible real); NO se usa 100vh acá porque en el celular
+// cuenta la barra del navegador y dejaría la barra de navegación inferior fuera de la pantalla.
+const WEB_ROOT_STYLE = Platform.OS === 'web' ? { height: '100%', overflow: 'hidden' } : null;
+
 const NAV = [
   { key: 'home',   label: 'Inicio',       icon: 'home'       },
   { key: 'stats',  label: 'Estadísticas', icon: 'bar-chart-2' },
@@ -5475,7 +5679,7 @@ function AppShell({ onLogout, initialPrefs, onPrefsChange }) {
   }
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: C.bg }}>
+    <SafeAreaView style={[{ flex: 1, backgroundColor: C.bg }, WEB_ROOT_STYLE]}>
       <StatusBar barStyle={prefs.darkMode ? 'light-content' : 'dark-content'} backgroundColor={C.bg} />
 
       {/* Contenido principal sin zIndex problemático */}
@@ -5630,7 +5834,7 @@ function LoginScreen({ onLogin }) {
   return (
     <KeyboardAvoidingView
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      style={st.loginRoot}
+      style={[st.loginRoot, WEB_ROOT_STYLE]}
     >
       <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
       <ScrollView
@@ -5832,12 +6036,18 @@ export default function App() {
   // Supabase renueva el acceso cada tanto: se mantiene al día lo que quedó recordado
   useEffect(() => AuthService.subscribeSessionUpdates(), []);
 
+  // Web instalada en el celular (PWA): sin zoom ni rebote, alto real visible y teclado bien manejado
+  useEffect(() => {
+    if (Platform.OS !== 'web') return undefined;
+    return installWebAppShell();
+  }, []);
+
   const handleLogout = useCallback(async () => {
     await AuthService.signOut();          // borra la sesión recordada y cierra en Supabase
     setScreen('login');
   }, []);
 
-  if (!bootPrefs || !authReady) return <View style={{ flex: 1, backgroundColor: LIGHT.bg }} />;
+  if (!bootPrefs || !authReady) return <View style={[{ flex: 1, backgroundColor: LIGHT.bg }, WEB_ROOT_STYLE]} />;
 
   return screen === 'login'
     ? <LoginScreen onLogin={() => setScreen('app')} />
