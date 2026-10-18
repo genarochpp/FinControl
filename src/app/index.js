@@ -47,6 +47,11 @@
 //     en los demás (Supabase Realtime: INSERT / UPDATE / DELETE). Si no hay internet los cambios
 //     quedan en una cola en el celular y se envían solos. Requiere ejecutar una vez el archivo
 //     supabase/migrations/20261016_familia_sincronizada.sql.
+// 20. Micrófono: un único reconocedor (SpeechController) con continuous = false e
+//     interimResults = false, idioma es-AR (es-ES de respaldo), estados reales
+//     (preparando → escuchando), segundo toque = stop(), errores explicados con claridad
+//     (permiso bloqueado, iPhone con la web instalada, sin sonido captado, red) y un
+//     detalle técnico para diagnosticar.
 // ═══════════════════════════════════════════════════════════════════════════
 
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
@@ -1270,74 +1275,257 @@ const getSpeechRecognitionClass = () => {
   return window.SpeechRecognition || window.webkitSpeechRecognition || null;
 };
 
-// Código de error del navegador → mensaje entendible
-const speechErrorMessage = (code) => {
-  switch (code) {
-    case 'not-allowed':
-    case 'service-not-allowed':
-      return 'El navegador no tiene permiso para usar el micrófono. Habilitalo desde el candado de la barra de direcciones y probá de nuevo.';
-    case 'no-speech':
-      return 'No te escuché. Acercate al micrófono y probá de nuevo.';
-    case 'audio-capture':
-      return 'No encontré un micrófono. Revisá que esté conectado y habilitado.';
-    case 'network':
-      return 'El reconocimiento de voz necesita conexión a internet. Revisá tu conexión.';
-    case 'language-not-supported':
-      return 'Este navegador no tiene el idioma español para el dictado.';
-    default:
-      return 'No pude usar el micrófono' + (code ? ` (${code}).` : '.');
-  }
+// Dónde está corriendo la app (sirve para dar avisos que ayuden de verdad)
+const getSpeechEnv = (nav, win) => {
+  nav = nav || (typeof navigator !== 'undefined' ? navigator : null);
+  win = win || (typeof window !== 'undefined' ? window : null);
+  const ua = (nav && nav.userAgent) || '';
+  // iPhone / iPad (el iPad moderno se presenta como "Mac" con pantalla táctil)
+  const ios = /iPad|iPhone|iPod/.test(ua) || (!!nav && nav.platform === 'MacIntel' && nav.maxTouchPoints > 1);
+  const android = /Android/i.test(ua);
+  // ¿La web está instalada en la pantalla de inicio (PWA)?
+  let standalone = false;
+  try {
+    standalone = !!(nav && nav.standalone) ||
+      !!(win && win.matchMedia && win.matchMedia('(display-mode: standalone)').matches);
+  } catch (_) { /* sin matchMedia */ }
+  return { ios, android, standalone };
 };
 
-// Inicia el reconocimiento en español de Argentina.
-//  · onInterim(texto): texto parcial mientras la persona habla.
-//  · onDone({ text, errorCode }): una sola vez, cuando termina o falla.
-// Devuelve { stop, abort } o null si el navegador no soporta voz.
-// stop() termina de escuchar y entrega lo dicho; abort() descarta todo.
-const startSpeechRecognition = ({ onInterim, onDone }) => {
-  const SR = getSpeechRecognitionClass();
-  if (!SR) return null;
-
-  const rec = new SR();
-  rec.lang            = 'es-AR';
-  rec.continuous      = false;
-  rec.interimResults  = true;
-  rec.maxAlternatives = 1;
-
-  let finalText = '';
-  let latest    = '';
-  let errorCode = null;
-  let finished  = false;
-
-  rec.onresult = (event) => {
-    let interim = '';
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      const piece = event.results[i][0] ? event.results[i][0].transcript : '';
-      if (event.results[i].isFinal) finalText += piece; else interim += piece;
-    }
-    latest = (finalText + interim).trim();
-    if (onInterim) onInterim(latest);
-  };
-  rec.onerror = (event) => { errorCode = (event && event.error) || 'unknown'; };
-  rec.onend   = () => {
-    if (finished) return;
-    finished = true;
-    onDone({ text: finalText.trim() || latest, errorCode });
-  };
-
+// Estado del permiso del micrófono SIN pedirlo: 'granted' | 'denied' | 'prompt' | 'unknown'
+const getMicPermissionState = async (nav) => {
+  nav = nav || (typeof navigator !== 'undefined' ? navigator : null);
   try {
-    rec.start();
-  } catch (e) {
-    // start() puede fallar si ya había una sesión activa
-    finished = true;
-    onDone({ text: '', errorCode: 'start-failed' });
-    return { stop() {}, abort() {} };
-  }
+    if (nav && nav.permissions && nav.permissions.query) {
+      const status = await nav.permissions.query({ name: 'microphone' });
+      return status.state;
+    }
+  } catch (_) { /* este navegador no permite consultarlo */ }
+  return 'unknown';
+};
 
-  return {
-    stop()  { try { rec.stop(); }  catch (_) {} },
-    abort() { finished = true; try { rec.abort(); } catch (_) {} },
-  };
+// Avisa cuando cambia el permiso (por ejemplo cuando la persona toca "Permitir").
+// Devuelve la función para dejar de escuchar.
+const watchMicPermission = (onChange, nav) => {
+  nav = nav || (typeof navigator !== 'undefined' ? navigator : null);
+  let status = null;
+  let alive  = true;
+  (async () => {
+    try {
+      if (!(nav && nav.permissions && nav.permissions.query)) { onChange('unknown'); return; }
+      status = await nav.permissions.query({ name: 'microphone' });
+      if (!alive) return;
+      onChange(status.state);
+      status.onchange = () => { if (alive) onChange(status.state); };
+    } catch (_) {
+      if (alive) onChange('unknown');
+    }
+  })();
+  return () => { alive = false; if (status) status.onchange = null; };
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DICTADO POR VOZ — un único reconocedor reutilizable
+//
+//  · La instancia de reconocimiento se crea UNA sola vez y se reutiliza en todos los
+//    toques (no se crea en cada render ni en cada dictado).
+//  · Configuración pensada para celulares: continuous = false e interimResults = false
+//    (una frase, un resultado final), idioma es-AR (con es-ES de respaldo).
+//  · Los eventos onstart / onresult / onerror / onend mantienen un estado claro
+//    ('idle' → 'starting' → 'listening' → 'stopping' → 'idle') y avisan a quien pidió el
+//    dictado. Nunca se reinicia solo y nunca se llama a start() si ya está grabando.
+//  · Un segundo toque llama a stop(): termina limpio y entrega lo que alcanzó a oír.
+// ─────────────────────────────────────────────────────────────────────────────
+const SPEECH_LANG          = 'es-AR';
+const SPEECH_LANG_FALLBACK = 'es-ES';
+const SPEECH_COOLDOWN_MS   = 400;     // pausa mínima entre el final de un dictado y el siguiente
+const SPEECH_TOO_FAST_MS   = 1500;    // si termina antes de esto sin captar sonido, falló la captura
+const SPEECH_STALE_MS      = 1500;    // espera máxima al "fin" de un dictado cancelado
+
+const speechLog = (...args) => { try { console.log('[FinControl][voz]', ...args); } catch (_) {} };
+
+const SpeechController = {
+  _rec: null,               // la ÚNICA instancia del navegador
+  _lang: SPEECH_LANG,
+  _state: 'idle',           // 'idle' | 'starting' | 'listening' | 'stopping'
+  _run: null,               // datos del dictado en curso
+  _staleEnds: 0,            // "fin" que todavía tienen que llegar de dictados ya cancelados
+  _abortedAt: 0,
+  _lastEnd: 0,
+  _now() { return Date.now(); },
+
+  isSupported() { return !!getSpeechRecognitionClass(); },
+  isActive()    { return SpeechController._state !== 'idle'; },
+  getState()    { return SpeechController._state; },
+
+  // Crea la instancia la primera vez y le conecta los eventos una sola vez
+  _ensure() {
+    if (SpeechController._rec) return SpeechController._rec;
+    const SR = getSpeechRecognitionClass();
+    if (!SR) return null;
+    const rec = new SR();
+    rec.continuous      = false;     // una sola frase: evita cierres prematuros en el celular
+    rec.interimResults  = false;     // solo el resultado final
+    rec.maxAlternatives = 1;
+    rec.lang            = SpeechController._lang;
+    rec.onstart       = () => SpeechController._onStart();
+    rec.onaudiostart  = () => { if (SpeechController._run) SpeechController._run.audio = true; };
+    rec.onspeechstart = () => { if (SpeechController._run) SpeechController._run.speech = true; };
+    rec.onresult      = (e) => SpeechController._onResult(e);
+    rec.onerror       = (e) => SpeechController._onError(e);
+    rec.onend         = () => SpeechController._onEnd();
+    SpeechController._rec = rec;
+    return rec;
+  },
+
+  _onStart() {
+    const sc = SpeechController;
+    if (!sc._run) return;
+    if (sc._state === 'starting') sc._state = 'listening';
+    speechLog('start', sc._lang);
+    if (sc._run.handlers.onStart) sc._run.handlers.onStart();
+  },
+
+  // Junta lo que oyó. Por cada posición se queda con el último valor (si un navegador
+  // mandara resultados parciales, no se duplica el texto).
+  _onResult(e) {
+    const run = SpeechController._run;
+    if (!run || !e || !e.results) return;
+    for (let i = e.resultIndex || 0; i < e.results.length; i++) {
+      const r = e.results[i];
+      run.parts[i] = r && r[0] && r[0].transcript ? String(r[0].transcript).trim() : '';
+    }
+    run.text = run.parts.filter(Boolean).join(' ').trim();
+    speechLog('result', run.text);
+  },
+
+  _onError(e) {
+    const run = SpeechController._run;
+    if (!run) return;
+    run.error = (e && e.error) || 'unknown';
+    speechLog('error', run.error);
+    if (run.handlers.onError) run.handlers.onError(run.error);
+  },
+
+  _onEnd() {
+    const sc = SpeechController;
+    if (sc._staleEnds > 0) {                 // es el fin de un dictado que ya se canceló: se ignora
+      sc._staleEnds -= 1;
+      sc._lastEnd = sc._now();
+      return;
+    }
+    const run = sc._run;
+    if (!run) return;
+    const outcome = {
+      text: run.text, error: run.error, audio: run.audio, speech: run.speech,
+      userStopped: run.userStopped, durationMs: sc._now() - run.startedAt, lang: sc._lang,
+    };
+    sc._run = null;
+    sc._state = 'idle';
+    sc._lastEnd = sc._now();
+    speechLog('end', JSON.stringify(outcome));
+
+    // El idioma no está disponible: se prueba UNA sola vez con es-ES (sin bucles)
+    if (outcome.error === 'language-not-supported' && sc._lang !== SPEECH_LANG_FALLBACK) {
+      sc._lang = SPEECH_LANG_FALLBACK;
+      const again = sc.start(run.handlers, { retry: true });
+      if (again.ok) return;
+    }
+    if (run.handlers.onEnd) run.handlers.onEnd(outcome);
+  },
+
+  // Empieza a escuchar. handlers: { onStart(), onError(code), onEnd(outcome) }.
+  // Devuelve { ok: true } o { ok: false, reason: 'busy' | 'cooldown' | 'unsupported' | 'start-failed', error? }.
+  start(handlers, opts = {}) {
+    const sc = SpeechController;
+    if (sc._state !== 'idle') return { ok: false, reason: 'busy' };      // ya está grabando: NO se llama a start() de nuevo
+    if (sc._staleEnds > 0) {
+      if (sc._now() - sc._abortedAt < SPEECH_STALE_MS) return { ok: false, reason: 'busy' };
+      sc._rec = null; sc._staleEnds = 0;       // el "fin" nunca llegó: se vuelve a crear la instancia
+    }
+    if (!opts.retry && sc._now() - sc._lastEnd < SPEECH_COOLDOWN_MS) return { ok: false, reason: 'cooldown' };
+    const rec = sc._ensure();
+    if (!rec) return { ok: false, reason: 'unsupported' };
+    sc._run = { handlers: handlers || {}, startedAt: sc._now(), text: '', parts: [], error: null, audio: false, speech: false, userStopped: false };
+    sc._state = 'starting';
+    try {
+      rec.lang = sc._lang;
+      rec.start();
+    } catch (error) {
+      sc._run = null;
+      sc._state = 'idle';
+      sc._rec = null;                          // la instancia quedó en mal estado: se recrea en el próximo intento
+      speechLog('start() falló', error && error.name);
+      return { ok: false, reason: 'start-failed', error };
+    }
+    return { ok: true };
+  },
+
+  // Segundo toque: termina de escuchar y entrega lo que alcanzó a oír (llega por onEnd)
+  stop() {
+    const sc = SpeechController;
+    if (sc._state === 'idle' || !sc._rec) return false;
+    if (sc._state === 'stopping') return true;
+    sc._state = 'stopping';
+    if (sc._run) sc._run.userStopped = true;
+    try { sc._rec.stop(); } catch (_) {}
+    return true;
+  },
+
+  // Cancela sin entregar nada (al cerrar la pantalla)
+  abort() {
+    const sc = SpeechController;
+    if (sc._state === 'idle') return;
+    sc._run = null;
+    sc._state = 'idle';
+    sc._staleEnds += 1;
+    sc._abortedAt = sc._now();
+    try { sc._rec.abort(); } catch (_) { sc._staleEnds -= 1; }
+  },
+};
+
+// Qué decirle a la persona cuando el dictado no dio resultado. Devuelve null si no hace falta
+// avisar nada (cancelación propia, o ya hay texto), o { text, detail }.
+// env: { ios, standalone, permission } (ver getSpeechEnv / getMicPermissionState)
+const describeSpeechFailure = (o, env = {}) => {
+  if (!o || o.text) return null;
+  if (o.error === 'aborted') return null;
+  if (o.userStopped && !o.error) return null;               // la persona lo cortó a propósito
+  const secs   = (Number(o.durationMs || 0) / 1000).toFixed(1).replace('.', ',');
+  const detail = `Detalle técnico: ${o.error || 'sin error'} · ${secs} s · ${o.audio ? 'con' : 'sin'} sonido captado · ${o.lang || SPEECH_LANG}`;
+  const tooFast = Number(o.durationMs || 0) < SPEECH_TOO_FAST_MS && !o.audio;
+  const iosApp  = !!(env.ios && env.standalone);
+
+  const IOS_APP = 'En iPhone, el dictado por voz no funciona cuando FinControl está instalada en la pantalla de inicio (es una limitación de Apple). Abrila desde Safari, o escribí la frase abajo / usá el micrófono del teclado.';
+  const NO_CAPTURE = 'El micrófono se cerró enseguida sin captar sonido. Revisá que ninguna otra aplicación lo esté usando (llamadas, grabadores) y que el navegador tenga permiso de micrófono en los ajustes del teléfono. Después probá de nuevo.';
+
+  switch (o.error) {
+    case 'not-allowed':
+    case 'service-not-allowed':
+      if (iosApp) return { text: IOS_APP, detail };
+      if (env.permission === 'denied') {
+        return { text: 'El micrófono está bloqueado para este sitio. Tocá el candado o el ícono junto a la dirección → Permisos → Micrófono → Permitir, y probá de nuevo.', detail };
+      }
+      if (env.ios) {
+        return { text: 'Safari no dio permiso para el dictado. Tocá “Permitir” cuando aparezca el cartel y revisá que el Dictado esté activado en Ajustes → General → Teclado → Activar dictado.', detail };
+      }
+      return { text: 'El navegador no te dejó usar el micrófono. Probá de nuevo y tocá “Permitir” en el cartel. Si el cartel no aparece, habilitá el micrófono para este sitio en los permisos del navegador.', detail };
+    case 'no-speech':
+      if (iosApp && tooFast) return { text: IOS_APP, detail };
+      return { text: tooFast ? NO_CAPTURE : 'No te escuché. Acercate al micrófono, tocá el botón y hablá enseguida.', detail };
+    case 'audio-capture':
+      return { text: 'No encontré un micrófono disponible. Revisá que otra aplicación no lo esté usando.', detail };
+    case 'network':
+      return { text: 'El dictado necesita internet: el navegador manda el audio a su servicio de voz. Revisá tu conexión y probá de nuevo. Si el internet anda bien, es un problema momentáneo del servicio de voz del navegador: escribí la frase abajo.', detail };
+    case 'language-not-supported':
+      return { text: 'Tu navegador no tiene el idioma español para el dictado. Escribí la frase abajo.', detail };
+    case null:
+    case undefined:
+      if (iosApp && tooFast) return { text: IOS_APP, detail };
+      return { text: tooFast ? NO_CAPTURE : 'No te escuché. Acercate al micrófono, tocá el botón y hablá enseguida.', detail };
+    default:
+      return { text: `No pude usar el micrófono (${o.error}). Escribí la frase abajo.`, detail };
+  }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2732,7 +2920,9 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
   const [recur,   setRecur]   = useState(false);
 
   // Dictado por voz
-  const [listening,     setListening]     = useState(false);
+  const [listening,     setListening]     = useState(false);   // el navegador YA está grabando (evento onstart)
+  const [starting,      setStarting]      = useState(false);   // pidió el micrófono y todavía no empezó (p. ej. esperando "Permitir")
+  const [micPerm,       setMicPerm]       = useState('unknown'); // permiso del micrófono: granted | denied | prompt | unknown
   const [interpreting,  setInterpreting]  = useState(false);   // esperando la respuesta de Groq
   const [voiceText,     setVoiceText]     = useState('');
   const [voiceFeedback, setVoiceFeedback] = useState(null); // { ok: bool, text: string }
@@ -2745,20 +2935,21 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
   // Se incrementa al cerrar/resetear: si el "reconocimiento" termina después,
   // se ignora su resultado (evita completar campos en un formulario ya cerrado).
   const voiceToken  = useRef(0);
-  // Sesión de reconocimiento de voz activa (para poder terminarla o cancelarla)
-  const recognitionRef = useRef(null);
   // Siempre apunta a la última versión de applyVoiceText (los callbacks del
   // navegador se crean una sola vez y no deben usar una versión vieja)
   const applyVoiceRef  = useRef(null);
 
   // ¿Este entorno tiene reconocimiento de voz? (navegador sí; Expo Go en el teléfono no)
-  const speechSupported = !!getSpeechRecognitionClass();
+  const speechSupported = SpeechController.isSupported();
 
   // Al desmontar el modal, se corta el micrófono si quedó abierto
-  useEffect(() => () => {
-    if (recognitionRef.current) recognitionRef.current.abort();
-    recognitionRef.current = null;
-  }, []);
+  useEffect(() => () => { SpeechController.abort(); }, []);
+
+  // Permiso del micrófono: se consulta SIN pedirlo, para poder avisar si está bloqueado
+  useEffect(() => {
+    if (!visible || Platform.OS !== 'web') return undefined;
+    return watchMicPermission(setMicPerm);
+  }, [visible]);
 
   useEffect(() => {
     if (editTx) {
@@ -2796,9 +2987,8 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
     setDesc(''); setAmt(''); setCat('Comida'); setAuthor(null);
     setRecur(false);
     voiceToken.current += 1;            // cancela cualquier dictado en curso
-    if (recognitionRef.current) recognitionRef.current.abort();   // corta el micrófono
-    recognitionRef.current = null;
-    setListening(false); setInterpreting(false); setVoiceText(''); setVoiceFeedback(null);
+    SpeechController.abort();           // corta el micrófono
+    setListening(false); setStarting(false); setInterpreting(false); setVoiceText(''); setVoiceFeedback(null);
   };
 
   // ── Dictado ────────────────────────────────────────────────────────────────
@@ -2850,20 +3040,20 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
   // navegador siempre llamen a la versión más reciente.
   applyVoiceRef.current = applyVoiceText;
 
-  // Dictado con el micrófono del navegador (Web Speech API, es-AR):
-  //  1er toque → empieza a escuchar · 2º toque → termina de escuchar.
-  //  Al terminar, el texto transcrito se envía solo a Groq y se completan los campos.
+  // Dictado con el micrófono del navegador (Web Speech API). Un único reconocedor reutilizable
+  // (SpeechController) con continuous = false e interimResults = false, idioma es-AR.
+  //  · 1er toque → pide el micrófono y empieza · 2º toque → stop(): termina y entrega lo oído.
+  //  · "Escuchando…" aparece recién cuando el navegador avisa que empezó (evento onstart).
+  //  · Nunca se llama a start() si ya está grabando y nunca se reinicia solo.
+  //  · Al terminar, el texto se envía a Groq y se completan los campos; si falla, se explica por qué.
   const startListening = () => {
     if (interpreting) return;
 
-    // Segundo toque mientras escucha: termina y entrega lo dicho
-    if (listening) {
-      if (recognitionRef.current) recognitionRef.current.stop();
-      return;
-    }
+    // Ya está preparando o grabando: el toque lo termina de forma limpia
+    if (SpeechController.isActive()) { SpeechController.stop(); return; }
 
     // Sin soporte (teléfono con Expo Go, o un navegador sin voz): aviso amigable
-    if (!getSpeechRecognitionClass()) {
+    if (!SpeechController.isSupported()) {
       const msg = Platform.OS === 'web'
         ? 'Este navegador no permite el dictado por voz. Probá con Google Chrome o Microsoft Edge, o escribí la frase abajo.'
         : 'El dictado con el micrófono funciona en la versión web (en el navegador). En el teléfono, escribí la frase abajo —o usá el micrófono de tu teclado— y tocá “Completar campos con esta frase”.';
@@ -2872,30 +3062,56 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
       return;
     }
 
+    // Micrófono bloqueado para este sitio: el navegador ni siquiera lo preguntaría, así que se explica cómo habilitarlo
+    if (micPerm === 'denied') {
+      const d = describeSpeechFailure(
+        { text: '', error: 'not-allowed', audio: false, userStopped: false, durationMs: 0, lang: SPEECH_LANG },
+        { ...getSpeechEnv(), permission: 'denied' },
+      );
+      setVoiceFeedback({ ok: false, text: d.text });
+      return;
+    }
+
     const myToken = ++voiceToken.current;
     setVoiceFeedback(null);
     setVoiceText('');
-    setListening(true);     // antes de iniciar: si fallara de inmediato, onDone lo vuelve a apagar
+    setStarting(true);          // todavía NO está grabando: esperando al navegador (y al permiso, si lo pide)
 
-    recognitionRef.current = startSpeechRecognition({
-      // Muestra en vivo lo que se va entendiendo
-      onInterim: (t) => { if (myToken === voiceToken.current) setVoiceText(t); },
-      onDone: ({ text, errorCode }) => {
-        recognitionRef.current = null;
+    const res = SpeechController.start({
+      // El navegador confirmó que empezó a escuchar
+      onStart: () => {
+        if (myToken !== voiceToken.current) return;
+        setStarting(false);
+        setListening(true);
+      },
+      // Terminó (por silencio, por el segundo toque o por un error)
+      onEnd: async (outcome) => {
         if (myToken !== voiceToken.current) return;      // se cerró o reseteó mientras escuchaba
+        setStarting(false);
         setListening(false);
-        if (text) {                                       // hay texto → a Groq
-          setVoiceText(text);
-          applyVoiceRef.current(text);
+        if (outcome.text) {                               // hay texto → a Groq
+          setVoiceText(outcome.text);
+          applyVoiceRef.current(outcome.text);
           return;
         }
-        if (errorCode === 'aborted') return;
-        setVoiceFeedback({
-          ok: false,
-          text: errorCode ? speechErrorMessage(errorCode) : 'No te escuché. Acercate al micrófono y probá de nuevo.',
-        });
+        // Sin texto: se explica el motivo (si fue un problema de permiso, se consulta el estado real)
+        const isPermission = outcome.error === 'not-allowed' || outcome.error === 'service-not-allowed';
+        const permission = isPermission ? await getMicPermissionState() : micPerm;
+        if (myToken !== voiceToken.current) return;
+        const d = describeSpeechFailure(outcome, { ...getSpeechEnv(), permission });
+        if (d) setVoiceFeedback({ ok: false, text: d.text, detail: d.detail });
       },
     });
+
+    if (!res.ok) {
+      setStarting(false);
+      if (res.reason === 'busy' || res.reason === 'cooldown') return;   // toques muy seguidos: se ignoran
+      setVoiceFeedback({
+        ok: false,
+        text: 'No se pudo iniciar el micrófono. Probá de nuevo en un momento o escribí la frase abajo.',
+        detail: `Detalle técnico: ${res.reason}${res.error && res.error.name ? ' · ' + res.error.name : ''}`,
+      });
+    }
   };
 
   const handleSave = () => {
@@ -2985,23 +3201,25 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
                       style={[
                         st.micBtn,
                         listening && st.micBtnOn,
-                        !speechSupported && { opacity: 0.45 },
+                        (!speechSupported || micPerm === 'denied') && { opacity: 0.5 },
                       ]}
                       onPress={startListening}
                       disabled={interpreting}
                       activeOpacity={0.8}
                       accessibilityRole="button"
-                      accessibilityLabel={listening ? 'Terminar de dictar' : 'Dictar gasto con la voz'}
+                      accessibilityLabel={listening || starting ? 'Terminar de dictar' : 'Dictar gasto con la voz'}
                     >
-                      {interpreting
+                      {interpreting || starting
                         ? <ActivityIndicator size="small" color="#fff" />
                         : <Feather name={listening ? 'square' : 'mic'} size={30} color="#fff" />}
                     </TouchableOpacity>
                   </View>
                   <Text style={st.micLabel}>
                     {listening ? 'Escuchando… hablá ahora (tocá para terminar)'
+                      : starting ? 'Preparando el micrófono… si aparece un cartel, tocá “Permitir”'
                       : interpreting ? 'Interpretando con IA…'
                       : !speechSupported ? 'El micrófono funciona en el navegador. Acá podés escribir la frase:'
+                      : micPerm === 'denied' ? 'El micrófono está bloqueado en este sitio. Tocá el botón para ver cómo activarlo.'
                       : 'Tocá el micrófono y hablá'}
                   </Text>
 
@@ -3015,11 +3233,11 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
                       onChangeText={setVoiceText}
                       onSubmitEditing={() => voiceText.trim() && applyVoiceText(voiceText)}
                       returnKeyType="done"
-                      editable={!listening && !interpreting}
+                      editable={!listening && !starting && !interpreting}
                     />
                   </View>
 
-                  {voiceText.trim().length > 0 && !listening && (
+                  {voiceText.trim().length > 0 && !listening && !starting && (
                     <TouchableOpacity
                       style={[st.voiceApplyBtn, interpreting && { opacity: 0.6 }]}
                       onPress={() => applyVoiceText(voiceText)}
@@ -3048,9 +3266,16 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
                         color={voiceFeedback.ok ? C.positive : C.warn}
                         style={{ marginTop: 1 }}
                       />
-                      <Text style={[st.voiceFeedbackTxt, { color: voiceFeedback.ok ? C.positive : C.warn }]}>
-                        {voiceFeedback.text}
-                      </Text>
+                      <View style={{ flex: 1 }}>
+                        <Text style={[st.voiceFeedbackTxt, { color: voiceFeedback.ok ? C.positive : C.warn, flex: 0 }]}>
+                          {voiceFeedback.text}
+                        </Text>
+                        {voiceFeedback.detail ? (
+                          <Text style={[st.voiceFeedbackTxt, { color: C.inkMuted, fontSize: F.xs, marginTop: 4, flex: 0 }]}>
+                            {voiceFeedback.detail}
+                          </Text>
+                        ) : null}
+                      </View>
                     </View>
                   )}
                 </View>
