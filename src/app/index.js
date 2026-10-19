@@ -39,11 +39,6 @@
 //     Supabase Auth y "Recordar en este dispositivo" (guarda la sesión, nunca la contraseña).
 //     Los campos arrancan vacíos y sin sugerencias. Sin inicio con Google. El Inicio ya no
 //     muestra el gasto por persona y el modal de gastos tiene una cruz para cerrarlo.
-// 21. Celular / PWA: la clave de Groq sale de la variable de entorno EXPO_PUBLIC_GROQ_API_KEY
-//     (ya no está escrita en el código). Hojas de formulario (gasto, gasto fijo, cuota) con alto
-//     máximo real, botón de guardar en un pie fijo y teclado manejado (iOS/Android y web con
-//     visualViewport). La página no se desplaza ni rebota ni hace zoom; solo se desplazan las
-//     listas y los formularios.
 // 18. Informes: el Excel lleva el formato como atributos HTML (los programas de hojas de
 //     cálculo ignoran el CSS) y el PDF suma el logo y las tarjetas de métricas destacadas.
 // 19. Familia sincronizada: gastos, gastos fijos, cuotas, presupuestos, límites y auditoría
@@ -56,6 +51,14 @@
 //     (preparando → escuchando), segundo toque = stop(), errores explicados con claridad
 //     (permiso bloqueado, iPhone con la web instalada, sin sonido captado, red) y un
 //     detalle técnico para diagnosticar.
+// 21. Celular / PWA: la clave de Groq sale de la variable de entorno EXPO_PUBLIC_GROQ_API_KEY
+//     (ya no está escrita en el código). Hojas de formulario (gasto, gasto fijo, cuota) con alto
+//     máximo real, botón de guardar en un pie fijo y teclado manejado (iOS/Android y web con
+//     visualViewport). La página no se desplaza ni rebota ni hace zoom; solo se desplazan las
+//     listas y los formularios.
+// 22. Fecha del gasto: el formulario trae un campo "Fecha del gasto" (hoy por defecto cada vez que
+//     se abre) que despliega un calendario propio para elegir días anteriores. La fecha elegida se
+//     guarda en created_at ("AAAA-MM-DD") y la lista de gastos se mantiene ordenada por fecha.
 // ═══════════════════════════════════════════════════════════════════════════
 
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
@@ -210,7 +213,7 @@ const toRemoteTx = (tx) => {
 //  · toRemote / fromRemote: pasan de la forma que usa la app a la de la tabla, y al revés
 const SYNC_TABLES = {
   transactions: {
-    table: 'transactions', idKey: 'id', newestFirst: true,
+    table: 'transactions', idKey: 'id', newestFirst: true, sortKey: 'created_at',
     orderBy: [['created_at', false], ['inserted_at', false], ['id', false]],
     cacheKey: KEYS.TRANSACTIONS,
     toRemote: toRemoteTx,
@@ -281,10 +284,20 @@ const SYNC_TABLES = {
 };
 
 // ── Operaciones sobre las listas (puras: no tocan la pantalla ni la red) ─────
+// Si la tabla tiene sortKey (los gastos, por fecha), la fila entra en su lugar: un gasto con fecha
+// de días anteriores no queda primero en la lista. Dentro del mismo día, lo último cargado va
+// primero (el mismo orden con el que se lee de la nube).
 const upsertLocal = (cfg, list, row) => {
-  const id = row[cfg.idKey];
-  if (list.some(x => x[cfg.idKey] === id)) return list.map(x => (x[cfg.idKey] === id ? row : x));
-  return cfg.newestFirst ? [row, ...list] : [...list, row];
+  const id  = row[cfg.idKey];
+  const old = list.find(x => x[cfg.idKey] === id);
+  const key = (x) => String((x && cfg.sortKey && x[cfg.sortKey]) || '');
+  if (old && (!cfg.sortKey || key(old) === key(row))) return list.map(x => (x[cfg.idKey] === id ? row : x));
+  const rest = old ? list.filter(x => x[cfg.idKey] !== id) : list;
+  if (cfg.sortKey && cfg.newestFirst) {
+    const i = rest.findIndex(x => key(x) <= key(row));
+    return i < 0 ? [...rest, row] : [...rest.slice(0, i), row, ...rest.slice(i)];
+  }
+  return cfg.newestFirst ? [row, ...rest] : [...rest, row];
 };
 const removeLocal = (cfg, list, id) => list.filter(x => x[cfg.idKey] !== id);
 
@@ -2480,6 +2493,61 @@ const useSheetBox = () => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// FECHA DEL GASTO (calendario del formulario)
+//
+// Las fechas viajan siempre como texto "AAAA-MM-DD" en hora LOCAL (igual que todayISO):
+// así se guardan en la columna created_at de Supabase y se comparan con < y > sin errores.
+// ─────────────────────────────────────────────────────────────────────────────
+const WEEKDAYS_SHORT = ['L', 'M', 'M', 'J', 'V', 'S', 'D'];      // la semana empieza el lunes
+
+// "2026-10-18" → { y: 2026, m: 10, d: 18 }, o null si no es una fecha real (ej. 2026-02-30)
+const parseISODate = (iso) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
+  if (!match) return null;
+  const y = Number(match[1]), m = Number(match[2]), d = Number(match[3]);
+  const dt = new Date(y, m - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) return null;
+  return { y, m, d };
+};
+const isoFromParts = (y, m, d) => `${y}-${pad2(m)}-${pad2(d)}`;
+
+// Suma (o resta) días respetando cambios de mes y de año
+const addDaysISO = (iso, n) => {
+  const p = parseISODate(iso);
+  if (!p) return iso;
+  return todayISO(new Date(p.y, p.m - 1, p.d + n));
+};
+
+// "Hoy · domingo 18/10/2026", "Ayer · sábado 17/10/2026" o "Jueves 15/10/2026"
+const formatDateLong = (iso, today = todayISO()) => {
+  const p = parseISODate(iso);
+  if (!p) return String(iso || '');
+  const weekday = DAYS_ES[new Date(p.y, p.m - 1, p.d).getDay()].toLowerCase();
+  const text = `${weekday} ${pad2(p.d)}/${pad2(p.m)}/${p.y}`;
+  if (iso === today) return `Hoy · ${text}`;
+  if (iso === addDaysISO(today, -1)) return `Ayer · ${text}`;
+  return text.charAt(0).toUpperCase() + text.slice(1);
+};
+
+// Las 42 casillas (6 semanas, de lunes a domingo) del mes que se muestra
+const buildMonthGrid = (y, m) => {
+  const offset = (new Date(y, m - 1, 1).getDay() + 6) % 7;       // cuántos días del mes anterior se ven
+  return Array.from({ length: 42 }, (_, i) => {
+    const dt = new Date(y, m - 1, 1 - offset + i);
+    return { iso: todayISO(dt), day: dt.getDate(), inMonth: dt.getMonth() === m - 1 };
+  });
+};
+
+// Mes anterior / siguiente
+const shiftMonth = (y, m, delta) => {
+  const dt = new Date(y, m - 1 + delta, 1);
+  return { y: dt.getFullYear(), m: dt.getMonth() + 1 };
+};
+
+// ¿Se puede guardar esta fecha? (fecha real y no futura)
+const isValidExpenseDate = (iso, today = todayISO()) => !!parseISODate(iso) && iso <= today;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // STYLE FACTORY
 // ─────────────────────────────────────────────────────────────────────────────
 const mkSt = C => StyleSheet.create({
@@ -2579,6 +2647,26 @@ const mkSt = C => StyleSheet.create({
   modalHandle:  { width: 40, height: 4, borderRadius: 2, backgroundColor: C.border, alignSelf: 'center', marginTop: 12, marginBottom: S.sm },
   modalInner:   { padding: S.lg, paddingBottom: 40 },
   modalTitle:   { fontSize: F.lg, fontWeight: '700', color: C.ink, marginBottom: S.md },
+  // Fecha del gasto: campo grande + calendario desplegable (casillas de 44 px para tocar cómodo)
+  dateField:    { minHeight: 52 },
+  dateFieldTxt: { flex: 1, fontSize: Platform.OS === 'web' ? Math.max(16, F.md) : F.md, fontWeight: '700', color: C.ink, paddingHorizontal: 12, paddingVertical: 14 },
+  calBox:       { marginTop: S.sm, backgroundColor: C.surface, borderWidth: 1.5, borderColor: C.border, borderRadius: R.md, padding: S.sm },
+  calQuickRow:  { flexDirection: 'row', gap: S.sm, marginBottom: S.sm },
+  calQuick:     { flex: 1, alignItems: 'center', justifyContent: 'center', minHeight: 44, borderRadius: R.sm, backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border },
+  calQuickOn:   { backgroundColor: C.accentBg, borderColor: C.accent },
+  calQuickTxt:  { fontSize: F.md, fontWeight: '700', color: C.ink },
+  calHeader:    { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: S.xs },
+  calNav:       { width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: C.surfaceAlt },
+  calTitle:     { fontSize: F.lg, fontWeight: '800', color: C.ink },
+  calWeekRow:   { flexDirection: 'row', marginBottom: 2 },
+  calWeekday:   { width: '14.2857%', textAlign: 'center', fontSize: F.xs, fontWeight: '700', color: C.inkMuted, paddingVertical: 4 },
+  calGrid:      { flexDirection: 'row', flexWrap: 'wrap' },
+  calCell:      { width: '14.2857%', alignItems: 'center', paddingVertical: 2 },
+  calDay:       { width: '92%', maxWidth: 44, aspectRatio: 1, borderRadius: 999, alignItems: 'center', justifyContent: 'center', borderWidth: 1.5, borderColor: 'transparent' },
+  calDayToday:  { borderColor: C.accent },
+  calDaySel:    { backgroundColor: C.accent, borderColor: C.accent },
+  calDayTxt:    { fontSize: F.md, fontWeight: '600', color: C.ink },
+  calHint:      { fontSize: F.xs, color: C.inkMuted, textAlign: 'center', marginTop: S.xs },
   // Hojas de formulario (gasto, gasto fijo, cuota): fondo, hoja con alto máximo real y pie fijo con el botón
   sheetRoot:     { flex: 1, justifyContent: 'flex-end' },
   sheetBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(15,23,42,0.52)' },
@@ -3092,6 +3180,128 @@ const CATS_META = [
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CAMPO "FECHA DEL GASTO" CON CALENDARIO
+//  · Muestra la fecha elegida ("Hoy · domingo 18/10/2026"). Tocándolo se despliega el calendario.
+//  · Atajos "Hoy" y "Ayer"; flechas para ir a meses anteriores; los días futuros no se pueden elegir.
+//  · Está hecho con componentes de la app (sin librerías): funciona igual en la web y en el teléfono.
+// ─────────────────────────────────────────────────────────────────────────────
+function DateField({ value, onChange, C }) {
+  const st    = mkSt(C);
+  const today = todayISO();
+  const sel   = parseISODate(value) || parseISODate(today);
+  const t     = parseISODate(today);
+  const [open, setOpen] = useState(false);
+  const [view, setView] = useState({ y: sel.y, m: sel.m });          // mes que se está mirando
+
+  // Al abrir, el calendario muestra el mes de la fecha elegida
+  const toggle = () => {
+    if (!open) setView({ y: sel.y, m: sel.m });
+    setOpen(o => !o);
+  };
+  const pick = (iso) => {
+    if (!isValidExpenseDate(iso, today)) return;                      // nunca una fecha futura
+    onChange(iso);
+    setOpen(false);
+  };
+  const canGoNext = view.y < t.y || (view.y === t.y && view.m < t.m);
+  const yesterday = addDaysISO(today, -1);
+
+  return (
+    <View style={{ marginBottom: S.md }}>
+      <TouchableOpacity
+        style={[st.inputWrap, st.dateField, open && { borderColor: C.accent }]}
+        onPress={toggle}
+        activeOpacity={0.8}
+        accessibilityRole="button"
+        accessibilityLabel={`Fecha del gasto: ${formatDateLong(value, today)}. Tocá para cambiarla`}
+      >
+        <Feather name="calendar" size={18} color={C.accent} style={st.inputIcon} />
+        <Text style={st.dateFieldTxt}>{formatDateLong(value, today)}</Text>
+        <Feather name={open ? 'chevron-up' : 'chevron-down'} size={18} color={C.inkMuted} style={{ paddingRight: 14 }} />
+      </TouchableOpacity>
+
+      {open && (
+        <View style={st.calBox}>
+          {/* Atajos */}
+          <View style={st.calQuickRow}>
+            {[['Hoy', today], ['Ayer', yesterday]].map(([label, iso]) => (
+              <TouchableOpacity
+                key={label}
+                style={[st.calQuick, value === iso && st.calQuickOn]}
+                onPress={() => pick(iso)}
+                accessibilityRole="button"
+              >
+                <Text style={[st.calQuickTxt, value === iso && { color: C.accent }]}>{label}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          {/* Mes y flechas */}
+          <View style={st.calHeader}>
+            <TouchableOpacity
+              style={st.calNav}
+              onPress={() => setView(v => shiftMonth(v.y, v.m, -1))}
+              accessibilityRole="button"
+              accessibilityLabel="Mes anterior"
+            >
+              <Feather name="chevron-left" size={20} color={C.ink} />
+            </TouchableOpacity>
+            <Text style={st.calTitle}>{MONTHS_ES[view.m - 1]} {view.y}</Text>
+            <TouchableOpacity
+              style={[st.calNav, !canGoNext && { opacity: 0.3 }]}
+              onPress={() => canGoNext && setView(v => shiftMonth(v.y, v.m, 1))}
+              disabled={!canGoNext}
+              accessibilityRole="button"
+              accessibilityLabel="Mes siguiente"
+            >
+              <Feather name="chevron-right" size={20} color={C.ink} />
+            </TouchableOpacity>
+          </View>
+
+          {/* Días de la semana (lunes a domingo) */}
+          <View style={st.calWeekRow}>
+            {WEEKDAYS_SHORT.map((w, i) => <Text key={i} style={st.calWeekday}>{w}</Text>)}
+          </View>
+
+          {/* Días del mes */}
+          <View style={st.calGrid}>
+            {buildMonthGrid(view.y, view.m).map(cell => {
+              const isSel   = cell.iso === value;
+              const isToday = cell.iso === today;
+              const future  = cell.iso > today;
+              return (
+                <TouchableOpacity
+                  key={cell.iso}
+                  style={st.calCell}
+                  onPress={() => pick(cell.iso)}
+                  disabled={future}
+                  activeOpacity={0.7}
+                  accessibilityRole="button"
+                  accessibilityLabel={formatDateLong(cell.iso, today)}
+                  accessibilityState={{ selected: isSel, disabled: future }}
+                >
+                  <View style={[st.calDay, isToday && st.calDayToday, isSel && st.calDaySel]}>
+                    <Text style={[
+                      st.calDayTxt,
+                      !cell.inMonth && { color: C.inkFaint },
+                      future && { color: C.inkFaint, opacity: 0.45 },
+                      isSel && { color: '#fff', fontWeight: '800' },
+                    ]}>
+                      {cell.day}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+          <Text style={st.calHint}>Elegí el día en que se hizo el gasto. Los días futuros no se pueden elegir.</Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // HOJA DE FORMULARIO (gasto, gasto fijo, cuota)
 //
 // Por qué antes el botón "Guardar" quedaba tapado: la hoja no tenía un alto máximo real (estaba
@@ -3145,6 +3355,7 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
   const [cat,     setCat]     = useState('Comida');
   const [author,  setAuthor]  = useState(null);          // familiar OPCIONAL: null = sin asignar
   const [recur,   setRecur]   = useState(false);
+  const [txDate,  setTxDate]  = useState(todayISO());    // fecha del gasto ("AAAA-MM-DD"): hoy por defecto
 
   // Dictado por voz
   const [listening,     setListening]     = useState(false);   // el navegador YA está grabando (evento onstart)
@@ -3183,6 +3394,7 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
       setDesc(editTx.description); setAmt(numToInput(editTx.amount));
       setCat(editTx.category);     setAuthor(editTx.created_by || null);
       setRecur(editTx.is_recurring);
+      setTxDate(parseISODate(editTx.created_at) ? editTx.created_at : todayISO());   // al editar, su fecha
     } else {
       resetForm();
     }
@@ -3213,6 +3425,7 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
   const resetForm = () => {
     setDesc(''); setAmt(''); setCat('Comida'); setAuthor(null);
     setRecur(false);
+    setTxDate(todayISO());              // cada vez que se abre el formulario, la fecha arranca en hoy
     voiceToken.current += 1;            // cancela cualquier dictado en curso
     SpeechController.abort();           // corta el micrófono
     setListening(false); setStarting(false); setInterpreting(false); setVoiceText(''); setVoiceFeedback(null);
@@ -3344,13 +3557,15 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
   const handleSave = () => {
     const parsed = parseAmount(amt);        // "1.234,56" → 1234.56
     if (!desc.trim() || !parsed || parsed <= 0) { showAlert('Completá todos los campos'); return; }
+    if (!isValidExpenseDate(txDate)) { showAlert('Revisá la fecha', 'La fecha del gasto tiene que ser hoy o un día anterior.'); return; }
     const base = isEdit
       ? editTx
-      : { id: 't' + Date.now(), type: 'expense', created_at: todayISO() };
+      : { id: 't' + Date.now(), type: 'expense' };
     onSave({
       ...base, amount: parsed, description: desc.trim(), category: cat,
       featherIcon: CAT_ICON_MAP[cat] || 'more-horizontal',
       is_recurring: recur, created_by: author,
+      created_at: txDate,               // la fecha elegida ("AAAA-MM-DD") se guarda en Supabase (columna created_at)
     });
     resetForm();
   };
@@ -3385,6 +3600,10 @@ function AddEditModal({ visible, onClose, onSave, editTx, C }) {
         </TouchableOpacity>
       )}
     >
+      {/* Fecha del gasto: hoy por defecto; tocándola se abre el calendario (gastos de días anteriores) */}
+      <Text style={st.fieldLabel}>Fecha del gasto</Text>
+      <DateField value={txDate} onChange={setTxDate} C={C} />
+
       {/* Author selector */}
       <Text style={st.fieldLabel}>
         ¿Quién gastó? <Text style={{ textTransform: 'none', fontWeight: '500' }}>(opcional)</Text>
